@@ -1,0 +1,9 @@
+﻿__pycache__/
+*.pyc
+dist/
+build/
+config.json
+primeval-span-*.json
+*.log
+_update_new.exe
+_do_update.bat

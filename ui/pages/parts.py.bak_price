@@ -1,0 +1,352 @@
+"""
+재고관리 시스템 - 부품 관리 페이지
+"""
+
+import os
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import threading
+from core.constants import COLORS, FONT_FAMILY, FONT_SIZES, PARTS_COLUMNS
+
+
+class PartsPage:
+    def __init__(self, app):
+        self.app = app
+        self.parts_tree = None
+        self.parts_search_var = None
+        self.parts_menu = None
+
+    def render(self):
+        """부품 관리 페이지 렌더링"""
+        scroll_frame = self.app._create_scrollable_frame()
+
+        # 타이틀 & 버튼
+        header = tk.Frame(scroll_frame, bg=COLORS["bg"])
+        header.pack(fill=tk.X, padx=5, pady=(0, 10))
+        tk.Label(header, text="🔩 부품 관리", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=(FONT_FAMILY, FONT_SIZES["title"], "bold")).pack(side=tk.LEFT)
+        tk.Button(header, text="+ 부품 추가", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                  bg=COLORS["primary"], fg="white", padx=15, pady=5,
+                  cursor="hand2", command=self._add_part_dialog).pack(side=tk.RIGHT)
+        tk.Button(header, text="📄 엑셀 대량 등록", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                  bg=COLORS["info"], fg="white", padx=15, pady=5,
+                  cursor="hand2", command=self._bulk_upload_parts).pack(side=tk.RIGHT, padx=(0, 8))
+        tk.Button(header, text="📝 양식 다운로드", font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg="#e2e8f0", fg="#374151", padx=12, pady=5,
+                  cursor="hand2", command=self._download_parts_template).pack(side=tk.RIGHT, padx=(0, 8))
+
+        # 검색
+        search_frame = tk.Frame(scroll_frame, bg=COLORS["bg"])
+        search_frame.pack(fill=tk.X, padx=5, pady=(0, 10))
+        tk.Label(search_frame, text="🔍 검색 (품번/부품명):", bg=COLORS["bg"],
+                 font=(FONT_FAMILY, FONT_SIZES["small"])).pack(side=tk.LEFT)
+        self.parts_search_var = tk.StringVar()
+        search_entry = tk.Entry(search_frame, textvariable=self.parts_search_var,
+                                font=(FONT_FAMILY, FONT_SIZES["small"]), width=30)
+        search_entry.pack(side=tk.LEFT, padx=5)
+        tk.Button(search_frame, text="검색", font=(FONT_FAMILY, FONT_SIZES["tiny"]),
+                  command=lambda: self._load_parts_tree()).pack(side=tk.LEFT)
+        tk.Button(search_frame, text="새로고침", font=(FONT_FAMILY, FONT_SIZES["tiny"]),
+                  command=lambda: (self.parts_search_var.set(""), self._load_parts_tree())).pack(side=tk.LEFT, padx=5)
+
+        # 테이블
+        card = tk.Frame(scroll_frame, bg=COLORS["card_bg"],
+                        highlightbackground=COLORS["border"], highlightthickness=1)
+        card.pack(fill=tk.BOTH, expand=True, padx=5)
+
+        self.parts_tree = ttk.Treeview(card, columns=PARTS_COLUMNS, show="headings", height=20)
+        for col in PARTS_COLUMNS:
+            self.parts_tree.heading(col, text=col)
+            self.parts_tree.column(col, width=100, anchor="center")
+        self.parts_tree.column("부품명", width=180)
+        self.parts_tree.column("업체명", width=130)
+        self.parts_tree.column("비고", width=150)
+
+        parts_scroll = ttk.Scrollbar(card, orient="vertical", command=self.parts_tree.yview)
+        self.parts_tree.configure(yscrollcommand=parts_scroll.set)
+        self.parts_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        parts_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 우클릭 메뉴
+        self.parts_menu = tk.Menu(self.app.root, tearoff=0)
+        self.parts_menu.add_command(label="수정", command=self._edit_part_dialog)
+        self.parts_menu.add_command(label="삭제", command=self._delete_part)
+        self.parts_tree.bind("<Button-3>", self._parts_right_click)
+
+        self._load_parts_tree()
+
+    def _load_parts_tree(self):
+        def load():
+            try:
+                parts = self.app.db.get_all_parts()
+                self.app.root.after(0, lambda: render(parts))
+            except Exception as e:
+                err_msg = str(e)
+                self.app.root.after(0, lambda: messagebox.showerror("오류", err_msg))
+
+        def render(parts):
+            self.parts_tree.delete(*self.parts_tree.get_children())
+            search = self.parts_search_var.get().strip().lower()
+            for p in parts:
+                if search and search not in str(p.get("품번", "")).lower() and search not in str(p.get("부품명", "")).lower():
+                    continue
+                current = int(p.get("현재재고", 0))
+                safety = int(p.get("안전재고", 0))
+                status = "정상"
+                if safety > 0 and current <= safety:
+                    status = "⚠️ 부족"
+                elif safety > 0 and current <= safety * 1.2:
+                    status = "주의"
+
+                self.parts_tree.insert("", "end", values=(
+                    p.get("품번", ""), p.get("부품명", ""), p.get("규격", ""),
+                    p.get("단위", ""), p.get("업체명", ""), current, safety, status, p.get("비고", ""),
+                ))
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def _parts_right_click(self, event):
+        item = self.parts_tree.identify_row(event.y)
+        if item:
+            self.parts_tree.selection_set(item)
+            self.parts_menu.post(event.x_root, event.y_root)
+
+    def _add_part_dialog(self):
+        dialog = tk.Toplevel(self.app.root)
+        dialog.title("부품 추가")
+        dialog.geometry("400x450")
+        dialog.resizable(False, False)
+        dialog.transient(self.app.root)
+        dialog.grab_set()
+
+        fields = {}
+        labels = [("품번", ""), ("부품명", ""), ("규격", ""), ("단위", "EA"),
+                  ("업체명", ""), ("현재재고", "0"), ("안전재고", "0"), ("비고", "")]
+
+        for i, (label, default) in enumerate(labels):
+            tk.Label(dialog, text=label + ":", font=(FONT_FAMILY, FONT_SIZES["small"])).grid(
+                row=i, column=0, padx=10, pady=5, sticky="e")
+            entry = tk.Entry(dialog, font=(FONT_FAMILY, FONT_SIZES["small"]), width=30)
+            entry.grid(row=i, column=1, padx=10, pady=5)
+            entry.insert(0, default)
+            fields[label] = entry
+
+        def save():
+            try:
+                self.app.db.add_part(
+                    fields["품번"].get().strip(), fields["부품명"].get().strip(),
+                    fields["규격"].get().strip(), fields["단위"].get().strip(),
+                    int(fields["현재재고"].get()), int(fields["안전재고"].get()),
+                    fields["비고"].get().strip(), fields["업체명"].get().strip(),
+                )
+                messagebox.showinfo("성공", "부품이 추가되었습니다.")
+                dialog.destroy()
+                self._load_parts_tree()
+            except Exception as e:
+                messagebox.showerror("오류", str(e))
+
+        tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                  bg=COLORS["primary"], fg="white", padx=20, pady=5,
+                  command=save).grid(row=len(labels), column=0, columnspan=2, pady=15)
+
+    def _edit_part_dialog(self):
+        selected = self.parts_tree.selection()
+        if not selected:
+            return
+        values = self.parts_tree.item(selected[0])["values"]
+
+        dialog = tk.Toplevel(self.app.root)
+        dialog.title("부품 수정")
+        dialog.geometry("400x450")
+        dialog.resizable(False, False)
+        dialog.transient(self.app.root)
+        dialog.grab_set()
+
+        fields = {}
+        labels = [("품번", str(values[0])), ("부품명", str(values[1])), ("규격", str(values[2])),
+                  ("단위", str(values[3])), ("업체명", str(values[4])),
+                  ("현재재고", str(values[5])), ("안전재고", str(values[6])),
+                  ("비고", str(values[8]))]
+
+        for i, (label, default) in enumerate(labels):
+            tk.Label(dialog, text=label + ":", font=(FONT_FAMILY, FONT_SIZES["small"])).grid(
+                row=i, column=0, padx=10, pady=5, sticky="e")
+            entry = tk.Entry(dialog, font=(FONT_FAMILY, FONT_SIZES["small"]), width=30)
+            entry.grid(row=i, column=1, padx=10, pady=5)
+            entry.insert(0, default)
+            if label == "품번":
+                entry.configure(state="readonly")
+            fields[label] = entry
+
+        def save():
+            try:
+                self.app.db.update_part(
+                    fields["품번"].get().strip(), fields["부품명"].get().strip(),
+                    fields["규격"].get().strip(), fields["단위"].get().strip(),
+                    int(fields["현재재고"].get()), int(fields["안전재고"].get()),
+                    fields["비고"].get().strip(), fields["업체명"].get().strip(),
+                )
+                messagebox.showinfo("성공", "부품 정보가 수정되었습니다.")
+                dialog.destroy()
+                self._load_parts_tree()
+            except Exception as e:
+                messagebox.showerror("오류", str(e))
+
+        tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                  bg=COLORS["primary"], fg="white", padx=20, pady=5,
+                  command=save).grid(row=len(labels), column=0, columnspan=2, pady=15)
+
+    def _delete_part(self):
+        selected = self.parts_tree.selection()
+        if not selected:
+            return
+        values = self.parts_tree.item(selected[0])["values"]
+        part_id = str(values[0])
+        part_name = str(values[1])
+
+        if messagebox.askyesno("삭제 확인", f"'{part_name}({part_id})' 부품을 삭제하시겠습니까?"):
+            try:
+                self.app.db.delete_part(part_id)
+                messagebox.showinfo("성공", "부품이 삭제되었습니다.")
+                self._load_parts_tree()
+            except Exception as e:
+                messagebox.showerror("오류", str(e))
+
+    def _download_parts_template(self):
+        filepath = filedialog.asksaveasfilename(
+            title="부품 대량 등록 양식 저장", defaultextension=".xlsx",
+            initialfile="부품_대량등록_양식.xlsx", filetypes=[("Excel 파일", "*.xlsx")])
+        if not filepath:
+            return
+        try:
+            from utils.excel_utils import create_parts_template
+            create_parts_template(filepath)
+            messagebox.showinfo("완료",
+                f"양식 파일이 저장되었습니다.\n{filepath}\n\n"
+                "양식에 맞춰 부품 정보를 입력한 후,\n'엑셀 대량 등록' 버튼으로 업로드하세요.")
+        except Exception as e:
+            messagebox.showerror("오류", str(e))
+
+    def _bulk_upload_parts(self):
+        if not self.app.connected:
+            messagebox.showwarning("연결 필요", "먼저 구글 시트에 연결해 주세요.")
+            return
+
+        filepath = filedialog.askopenfilename(
+            title="부품 대량 등록 엑셀 파일 선택",
+            filetypes=[("Excel 파일", "*.xlsx"), ("모든 파일", "*.*")])
+        if not filepath:
+            return
+
+        try:
+            from utils.excel_utils import parse_parts_excel
+            parts_to_upload = parse_parts_excel(filepath)
+        except Exception as e:
+            messagebox.showerror("파일 오류", f"엑셀 파일을 읽는 중 오류가 발생했습니다.\n{e}")
+            return
+
+        if not parts_to_upload:
+            messagebox.showwarning("데이터 없음",
+                "엑셀 파일에서 등록할 부품 데이터를 찾을 수 없습니다.\n"
+                "품번과 부품명이 모두 입력되어 있는지 확인해 주세요.")
+            return
+
+        # 미리보기 대화상자
+        preview = tk.Toplevel(self.app.root)
+        preview.title("부품 대량 등록 미리보기")
+        screen_w = preview.winfo_screenwidth()
+        screen_h = preview.winfo_screenheight()
+        win_w = max(1000, int(screen_w * 0.7))
+        win_h = max(650, int(screen_h * 0.75))
+        x = (screen_w - win_w) // 2
+        y = (screen_h - win_h) // 2
+        preview.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        preview.minsize(900, 600)
+        preview.transient(self.app.root)
+        preview.grab_set()
+
+        tk.Label(preview, text=f"엑셀 파일에서 {len(parts_to_upload)}건의 부품을 찾았습니다.",
+                 font=(FONT_FAMILY, 12, "bold")).pack(pady=(15, 5))
+        tk.Label(preview, text="※ 품번이 기존에 있으면 업데이트, 없으면 신규 등록됩니다.",
+                 font=(FONT_FAMILY, FONT_SIZES["small"]), fg="#6b7280").pack(pady=(0, 10))
+
+        cols = ("품번", "부품명", "규격", "단위", "업체명", "현재재고", "안전재고", "비고")
+        tree_frame = tk.Frame(preview)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=15)
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=100, anchor="center")
+        tree.column("부품명", width=180)
+        tree.column("규격", width=180)
+
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=tree_scroll.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for p in parts_to_upload:
+            tree.insert("", "end", values=(
+                p["품번"], p["부품명"], p["규격"], p["단위"],
+                p.get("업체명", ""), p["현재재고"], p["안전재고"], p["비고"]))
+
+        status_label = tk.Label(preview, text="", font=(FONT_FAMILY, FONT_SIZES["small"]))
+        status_label.pack(pady=5)
+
+        btn_frame = tk.Frame(preview)
+        btn_frame.pack(pady=(5, 15))
+
+        def do_upload():
+            upload_btn.configure(state="disabled")
+            cancel_btn.configure(state="disabled")
+            status_label.configure(text="업로드 중... (시간이 걸릴 수 있습니다)", fg="#d97706")
+            preview.update()
+
+            def upload_thread():
+                try:
+                    total = len(parts_to_upload)
+
+                    def progress_cb(msg):
+                        self.app.root.after(0, lambda m=msg: status_label.configure(text=m))
+
+                    progress_cb(f"업로드 준비 중... (총 {total}건)")
+                    new_count, update_count = self.app.db.bulk_add_or_update_parts(
+                        parts_to_upload, progress_callback=progress_cb)
+
+                    result_msg = f"✅ 완료! 신규 {new_count}건, 업데이트 {update_count}건"
+                    self.app.root.after(0, lambda: status_label.configure(text=result_msg, fg="#059669"))
+                    self.app.root.after(0, lambda: messagebox.showinfo("대량 등록 완료",
+                        f"부품 대량 등록이 완료되었습니다.\n\n"
+                        f"신규 등록: {new_count}건\n업데이트: {update_count}건\n합계: {total}건"))
+                    self.app.root.after(0, lambda: cancel_btn.configure(state="normal", text="닫기"))
+                    self.app.root.after(0, lambda: self._load_parts_tree())
+
+                except Exception as e:
+                    import traceback
+                    err_msg = str(e)
+                    tb_msg = traceback.format_exc()
+                    try:
+                        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                '..', '..', 'upload_error.log')
+                        with open(log_path, 'w', encoding='utf-8') as f:
+                            f.write(f'Error: {err_msg}\n\nTraceback:\n{tb_msg}')
+                    except:
+                        pass
+                    self.app.root.after(0, lambda: status_label.configure(
+                        text=f"❌ 업로드 실패: {err_msg}", fg="#dc2626"))
+                    self.app.root.after(0, lambda: upload_btn.configure(state="normal"))
+                    self.app.root.after(0, lambda: cancel_btn.configure(state="normal"))
+
+            threading.Thread(target=upload_thread, daemon=True).start()
+
+        upload_btn = tk.Button(btn_frame, text=f"✅ {len(parts_to_upload)}건 등록/업데이트 실행",
+                               font=(FONT_FAMILY, FONT_SIZES["body"], "bold"),
+                               bg="#059669", fg="white", padx=20, pady=8,
+                               cursor="hand2", command=do_upload)
+        upload_btn.pack(side=tk.LEFT, padx=10)
+
+        cancel_btn = tk.Button(btn_frame, text="취소", font=(FONT_FAMILY, FONT_SIZES["body"]),
+                               bg="#e2e8f0", fg="#374151", padx=20, pady=8,
+                               cursor="hand2", command=preview.destroy)
+        cancel_btn.pack(side=tk.LEFT, padx=10)

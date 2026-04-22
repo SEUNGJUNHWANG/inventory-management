@@ -1,0 +1,431 @@
+"""
+재고관리 시스템 - 엑셀 유틸리티
+엑셀 파일 파싱, 양식 생성, BOM 임포트 등
+"""
+
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import os
+
+
+# ─────────────────────────────────────────
+# 공통 스타일
+# ─────────────────────────────────────────
+_HEADER_FILL_REQ = PatternFill(start_color="DC2626", end_color="DC2626", fill_type="solid")
+_HEADER_FILL_OPT = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
+_EXAMPLE_FILL = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
+_HEADER_FONT = Font(name="맑은 고딕", bold=True, color="FFFFFF", size=11)
+_NORMAL_FONT = Font(name="맑은 고딕", size=10)
+_THIN_BORDER = Border(
+    left=Side(style="thin"), right=Side(style="thin"),
+    top=Side(style="thin"), bottom=Side(style="thin")
+)
+
+
+# ─────────────────────────────────────────
+# 부품 대량 등록 양식
+# ─────────────────────────────────────────
+def create_parts_template(save_path):
+    """부품 대량 등록 양식 엑셀 파일 생성"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "부품등록"
+
+    # 안내문구
+    ws.merge_cells("A1:H1")
+    ws["A1"] = "부품 대량 등록/업데이트 양식"
+    ws["A1"].font = Font(name="맑은 고딕", bold=True, size=14)
+    ws.row_dimensions[1].height = 30
+
+    ws.merge_cells("A2:H2")
+    ws["A2"] = "※ 코드(필수)가 이미 존재하면 업데이트, 없으면 신규 등록됩니다.  |  빨간 배경 = 필수 항목  |  파란 배경 = 예시 데이터 (삭제 후 사용)"
+    ws["A2"].font = Font(name="맑은 고딕", size=9, color="666666")
+    ws.row_dimensions[2].height = 22
+
+    # 헤더
+    headers = [
+        ("품번 (필수)", True), ("부품명 (필수)", True), ("규격", False),
+        ("단위", False), ("업체명", False), ("현재재고", False), ("안전재고", False), ("비고", False)
+    ]
+    for col, (header, required) in enumerate(headers, 1):
+        cell = ws.cell(row=3, column=col, value=header)
+        cell.fill = _HEADER_FILL_REQ if required else _HEADER_FILL_OPT
+        cell.font = _HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = _THIN_BORDER
+    ws.row_dimensions[3].height = 28
+
+    # 예시 데이터
+    examples = [
+        ["11008CO", "CONNECTOR 8P", "8핀 커넥터", "EA", "A업체", 100, 20, ""],
+        ["M1BJ16", "BOLT M6x16", "SUS304", "EA", "B업체", 500, 100, ""],
+        ["11072CA", "CABLE ASSY", "1.5m", "EA", "", 50, 10, ""],
+    ]
+    for row_idx, example in enumerate(examples, 4):
+        for col_idx, val in enumerate(example, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.fill = _EXAMPLE_FILL
+            cell.font = _NORMAL_FONT
+            cell.border = _THIN_BORDER
+
+    # 열 너비 설정
+    widths = [15, 25, 20, 8, 15, 12, 12, 20]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    wb.save(save_path)
+    return save_path
+
+
+def parse_parts_excel(file_path):
+    """엑셀 파일에서 부품 데이터 파싱"""
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    ws = wb.worksheets[0]
+
+    # 헤더 행 찾기: A열이 '품번'으로 시작하고 B열에 '부품명'이 있는 행
+    header_row = None
+    for row in range(1, min(10, ws.max_row + 1)):
+        val_a = str(ws.cell(row=row, column=1).value or "").strip()
+        val_b = str(ws.cell(row=row, column=2).value or "").strip()
+        if val_a.startswith("품번") and "부품명" in val_b:
+            header_row = row
+            break
+        if ("코드번호" in val_a or "코드" == val_a) and ("부품" in val_b or "업체" in val_b):
+            header_row = row
+            break
+
+    data_start = header_row + 1 if header_row else 1
+
+    parts = []
+    for row in range(data_start, ws.max_row + 1):
+        code = ws.cell(row=row, column=1).value
+        name = ws.cell(row=row, column=2).value
+        if not code or str(code).strip() == "":
+            continue
+        code = str(code).strip()
+        name = str(name).strip() if name else ""
+        if not name:
+            continue
+
+        spec = str(ws.cell(row=row, column=3).value or "").strip()
+        unit = str(ws.cell(row=row, column=4).value or "EA").strip()
+        if not unit:
+            unit = "EA"
+
+        supplier = str(ws.cell(row=row, column=5).value or "").strip()
+
+        try:
+            qty = int(float(str(ws.cell(row=row, column=6).value or 0)))
+        except (ValueError, TypeError):
+            qty = 0
+
+        try:
+            safety = int(float(str(ws.cell(row=row, column=7).value or 0)))
+        except (ValueError, TypeError):
+            safety = 0
+
+        note = str(ws.cell(row=row, column=8).value or "").strip()
+
+        parts.append({
+            "품번": code, "부품명": name, "규격": spec,
+            "단위": unit, "업체명": supplier, "현재재고": qty, "안전재고": safety, "비고": note
+        })
+
+    return parts
+
+
+# ─────────────────────────────────────────
+# BOM 대량 등록 양식
+# ─────────────────────────────────────────
+def create_bom_template(save_path, products=None, parts=None):
+    """
+    BOM 대량 등록 양식 엑셀 파일 생성
+    - 'BOM등록' 시트: 제품코드, 부품품번, 소요량, 단가, 비고
+    - '제품목록(참고)' 시트: 등록된 제품 목록
+    - '부품목록(참고)' 시트: 등록된 부품 목록
+    """
+    wb = openpyxl.Workbook()
+
+    # ── 시트1: BOM등록 ──
+    ws = wb.active
+    ws.title = "BOM등록"
+
+    # 안내문구
+    ws.merge_cells("A1:F1")
+    ws["A1"] = "BOM 대량 등록/업데이트 양식"
+    ws["A1"].font = Font(name="맑은 고딕", bold=True, size=14)
+    ws.row_dimensions[1].height = 30
+
+    ws.merge_cells("A2:F2")
+    ws["A2"] = ("※ 동일한 제품코드+부품품번 조합이 이미 있으면 업데이트, 없으면 신규 등록됩니다.  |  "
+                "빨간 배경 = 필수  |  파란 배경 = 예시 (삭제 후 사용)  |  "
+                "제품코드/부품품번은 '제품목록', '부품목록' 시트를 참고하세요.")
+    ws["A2"].font = Font(name="맑은 고딕", size=9, color="666666")
+    ws.row_dimensions[2].height = 22
+
+    # 헤더
+    headers = [
+        ("제품코드 (필수)", True), ("부품품번 (필수)", True),
+        ("소요량 (필수)", True), ("부품단가", False), ("비고", False)
+    ]
+    for col, (header, required) in enumerate(headers, 1):
+        cell = ws.cell(row=3, column=col, value=header)
+        cell.fill = _HEADER_FILL_REQ if required else _HEADER_FILL_OPT
+        cell.font = _HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = _THIN_BORDER
+    ws.row_dimensions[3].height = 28
+
+    # 예시 데이터
+    examples = [
+        ["PROD-001", "11008CO", 2, 1500, "메인보드용"],
+        ["PROD-001", "M1BJ16", 8, 120, "체결용"],
+        ["PROD-001", "11072CA", 1, 8500, ""],
+        ["PROD-002", "11008CO", 4, 1500, ""],
+        ["PROD-002", "M1BJ16", 12, 120, ""],
+    ]
+    for row_idx, example in enumerate(examples, 4):
+        for col_idx, val in enumerate(example, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.fill = _EXAMPLE_FILL
+            cell.font = _NORMAL_FONT
+            cell.border = _THIN_BORDER
+
+    widths = [18, 18, 12, 12, 25]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ── 시트2: 제품목록(참고) ──
+    ws2 = wb.create_sheet("제품목록(참고)")
+    ref_header_fill = PatternFill(start_color="059669", end_color="059669", fill_type="solid")
+    prod_headers = ["제품코드", "제품명", "규격", "현재재고"]
+    for col, h in enumerate(prod_headers, 1):
+        cell = ws2.cell(row=1, column=col, value=h)
+        cell.fill = ref_header_fill
+        cell.font = _HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = _THIN_BORDER
+
+    if products:
+        for row_idx, p in enumerate(products, 2):
+            ws2.cell(row=row_idx, column=1, value=str(p.get("제품코드", ""))).border = _THIN_BORDER
+            ws2.cell(row=row_idx, column=2, value=str(p.get("제품명", ""))).border = _THIN_BORDER
+            ws2.cell(row=row_idx, column=3, value=str(p.get("규격", ""))).border = _THIN_BORDER
+            ws2.cell(row=row_idx, column=4, value=p.get("현재재고", 0)).border = _THIN_BORDER
+
+    for i, w in enumerate([18, 25, 20, 12], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+
+    # ── 시트3: 부품목록(참고) ──
+    ws3 = wb.create_sheet("부품목록(참고)")
+    part_headers = ["품번", "부품명", "규격", "단위", "현재재고"]
+    for col, h in enumerate(part_headers, 1):
+        cell = ws3.cell(row=1, column=col, value=h)
+        cell.fill = ref_header_fill
+        cell.font = _HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = _THIN_BORDER
+
+    if parts:
+        for row_idx, p in enumerate(parts, 2):
+            ws3.cell(row=row_idx, column=1, value=str(p.get("품번", ""))).border = _THIN_BORDER
+            ws3.cell(row=row_idx, column=2, value=str(p.get("부품명", ""))).border = _THIN_BORDER
+            ws3.cell(row=row_idx, column=3, value=str(p.get("규격", ""))).border = _THIN_BORDER
+            ws3.cell(row=row_idx, column=4, value=str(p.get("단위", "EA"))).border = _THIN_BORDER
+            ws3.cell(row=row_idx, column=5, value=p.get("현재재고", 0)).border = _THIN_BORDER
+
+    for i, w in enumerate([15, 25, 20, 8, 12], 1):
+        ws3.column_dimensions[get_column_letter(i)].width = w
+
+    wb.save(save_path)
+    return save_path
+
+
+def parse_bom_excel(file_path):
+    """
+    BOM 대량 등록 엑셀 파일 파싱
+    반환: [{"제품코드": ..., "부품품번": ..., "소요량": ..., "단가": ..., "비고": ...}, ...]
+    """
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+
+    # 'BOM등록' 시트 또는 첫 번째 시트 사용
+    ws = None
+    for name in wb.sheetnames:
+        if "bom" in name.lower() or "BOM" in name or "등록" in name:
+            ws = wb[name]
+            break
+    if ws is None:
+        ws = wb.worksheets[0]
+
+    # 헤더 행 찾기
+    header_row = None
+    for row in range(1, min(10, ws.max_row + 1)):
+        val_a = str(ws.cell(row=row, column=1).value or "").strip()
+        val_b = str(ws.cell(row=row, column=2).value or "").strip()
+        if ("제품" in val_a and "코드" in val_a) and ("부품" in val_b or "품번" in val_b):
+            header_row = row
+            break
+        if val_a.startswith("제품코드") and val_b.startswith("부품품번"):
+            header_row = row
+            break
+
+    data_start = header_row + 1 if header_row else 1
+
+    bom_items = []
+    for row in range(data_start, ws.max_row + 1):
+        product_code = ws.cell(row=row, column=1).value
+        part_code = ws.cell(row=row, column=2).value
+
+        if not product_code or str(product_code).strip() == "":
+            continue
+        if not part_code or str(part_code).strip() == "":
+            continue
+
+        product_code = str(product_code).strip()
+        part_code = str(part_code).strip()
+
+        # 소요량
+        try:
+            qty = float(str(ws.cell(row=row, column=3).value or 1))
+            if qty <= 0:
+                qty = 1
+        except (ValueError, TypeError):
+            qty = 1
+
+        # 단가
+        try:
+            unit_price = float(str(ws.cell(row=row, column=4).value or 0))
+            if unit_price < 0:
+                unit_price = 0
+        except (ValueError, TypeError):
+            unit_price = 0
+
+        note = str(ws.cell(row=row, column=5).value or "").strip()
+
+        bom_items.append({
+            "제품코드": product_code,
+            "부품품번": part_code,
+            "소요량": qty,
+            "단가": unit_price,
+            "비고": note,
+        })
+
+    return bom_items
+
+
+# ─────────────────────────────────────────
+# 기존 BOM 엑셀 파일 임포트 (사내 양식)
+# ─────────────────────────────────────────
+def import_bom_excel(file_path, db):
+    """
+    BOM 엑셀 파일 임포트
+    - '부품리스트' 시트에서 부품 마스터 데이터를 읽어 등록
+    - 나머지 시트에서 제품별 BOM 데이터를 읽어 등록
+    """
+    import time
+
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    sheet_names = wb.sheetnames
+
+    parts_count = 0
+    products_count = 0
+    bom_count = 0
+
+    # 1) 부품리스트 시트 처리
+    parts_sheet_name = None
+    for name in sheet_names:
+        if "부품" in name and ("리스트" in name or "목록" in name or "list" in name.lower()):
+            parts_sheet_name = name
+            break
+
+    if parts_sheet_name:
+        ws = wb[parts_sheet_name]
+        header_row = 1
+        for row in range(1, min(10, ws.max_row + 1)):
+            val = str(ws.cell(row=row, column=1).value or "").strip()
+            if "코드" in val or "품번" in val:
+                header_row = row
+                break
+
+        batch_parts = []
+        for row in range(header_row + 1, ws.max_row + 1):
+            code = ws.cell(row=row, column=1).value
+            if not code or str(code).strip() == "":
+                continue
+            code = str(code).strip()
+
+            col2 = str(ws.cell(row=row, column=2).value or "").strip()
+            col3 = str(ws.cell(row=row, column=3).value or "").strip()
+            col4 = str(ws.cell(row=row, column=4).value or "").strip()
+
+            name = col3 if col3 else col2
+            spec = col4
+
+            batch_parts.append({
+                "품번": code, "부품명": name, "규격": spec,
+                "단위": "EA", "현재재고": 0, "안전재고": 0, "비고": col2 if col3 else ""
+            })
+
+        if batch_parts:
+            new_c, upd_c = db.bulk_add_or_update_parts(batch_parts)
+            parts_count = new_c + upd_c
+
+    # 2) 제품별 BOM 시트 처리
+    for name in sheet_names:
+        if name == parts_sheet_name:
+            continue
+        if "부품" in name and "리스트" in name:
+            continue
+
+        ws = wb[name]
+        if ws.max_row < 2:
+            continue
+
+        product_name = name.strip()
+        product_id = product_name
+
+        first_cell = str(ws.cell(row=1, column=1).value or "").strip()
+        if first_cell and len(first_cell) < 30:
+            product_id = first_cell
+
+        try:
+            existing = db.get_product_by_id(product_id)
+            if not existing:
+                db.add_product(product_id, product_name, "", 0, "")
+                products_count += 1
+                time.sleep(0.5)
+        except:
+            pass
+
+        header_row = 1
+        for row in range(1, min(5, ws.max_row + 1)):
+            val = str(ws.cell(row=row, column=1).value or "").strip()
+            if "코드" in val or "품번" in val or "번호" in val:
+                header_row = row
+                break
+
+        for row in range(header_row + 1, ws.max_row + 1):
+            part_code = ws.cell(row=row, column=1).value
+            if not part_code or str(part_code).strip() == "":
+                continue
+            part_code = str(part_code).strip()
+
+            qty_val = 1
+            for col in range(ws.max_column, 0, -1):
+                cell_val = ws.cell(row=row, column=col).value
+                try:
+                    qty_val = float(cell_val)
+                    if qty_val > 0:
+                        break
+                except (ValueError, TypeError):
+                    continue
+
+            try:
+                db.add_bom(product_id, part_code, qty_val, "")
+                bom_count += 1
+                time.sleep(0.3)
+            except:
+                pass
+
+    return f"부품 {parts_count}건, 제품 {products_count}건, BOM {bom_count}건 임포트 완료"
