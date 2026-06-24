@@ -1,4 +1,3 @@
 @echo off
-chcp 65001 >nul
 cd /d "%~dp0"
-cscript //nologo "start_app.vbs"
+start "" "C:\Users\user\AppData\Local\Programs\Python\Python311\pythonw.exe" "%~dp0launch.py"

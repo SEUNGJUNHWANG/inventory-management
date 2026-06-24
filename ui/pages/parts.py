@@ -6,8 +6,20 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
+from core.auth import Session
 from core.constants import COLORS, FONT_FAMILY, FONT_SIZES, PARTS_COLUMNS
+from ui.widget_utils import flash_btn
 
+
+def _bind_tree_scroll(tree):
+    """Treeview에 마우스 휠 스크롤 바인딩 (hover 기반)"""
+    def _on_mw(e):
+        try:
+            tree.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        except Exception:
+            pass
+    tree.bind("<Enter>", lambda e: tree.bind_all("<MouseWheel>", _on_mw))
+    tree.bind("<Leave>", lambda e: tree.unbind_all("<MouseWheel>"))
 
 class PartsPage:
     def __init__(self, app):
@@ -15,6 +27,8 @@ class PartsPage:
         self.parts_tree = None
         self.parts_search_var = None
         self.parts_menu = None
+        self._action_overlay = None
+        self._hovered_item = None
 
     def render(self):
         """부품 관리 페이지 렌더링"""
@@ -25,10 +39,12 @@ class PartsPage:
         header.pack(fill=tk.X, padx=5, pady=(0, 10))
         tk.Label(header, text="🔩 부품 관리", bg=COLORS["bg"],
                  fg=COLORS["text"], font=(FONT_FAMILY, FONT_SIZES["title"], "bold")).pack(side=tk.LEFT)
-        tk.Button(header, text="+ 부품 추가", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
-                  bg=COLORS["primary"], fg="white", padx=15, pady=5,
-                  cursor="hand2", command=self._add_part_dialog).pack(side=tk.RIGHT)
-        tk.Button(header, text="📄 엑셀 대량 등록", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+        if Session.has_write("parts"):
+            tk.Button(header, text="+ 부품 추가", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                      bg=COLORS["primary"], fg="white", padx=15, pady=5,
+                      cursor="hand2", command=self._add_part_dialog).pack(side=tk.RIGHT)
+        if Session.has_write("parts"):
+            tk.Button(header, text="📄 엑셀 대량 등록", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
                   bg=COLORS["info"], fg="white", padx=15, pady=5,
                   cursor="hand2", command=self._bulk_upload_parts).pack(side=tk.RIGHT, padx=(0, 8))
         tk.Button(header, text="📝 양식 다운로드", font=(FONT_FAMILY, FONT_SIZES["small"]),
@@ -44,6 +60,7 @@ class PartsPage:
         search_entry = tk.Entry(search_frame, textvariable=self.parts_search_var,
                                 font=(FONT_FAMILY, FONT_SIZES["small"]), width=30)
         search_entry.pack(side=tk.LEFT, padx=5)
+        search_entry.bind("<Return>", lambda e: self._load_parts_tree())
         tk.Button(search_frame, text="검색", font=(FONT_FAMILY, FONT_SIZES["tiny"]),
                   command=lambda: self._load_parts_tree()).pack(side=tk.LEFT)
         tk.Button(search_frame, text="새로고침", font=(FONT_FAMILY, FONT_SIZES["tiny"]),
@@ -82,12 +99,48 @@ class PartsPage:
             remaining = max(80, total - fixed)
             self.parts_tree.column("비고", width=remaining)
         self.parts_tree.bind("<Configure>", _on_tree_resize)
+        _bind_tree_scroll(self.parts_tree)
 
-        # 우클릭 메뉴
+        # 더블클릭 → 수정
+        self.parts_tree.bind("<Double-1>", lambda e: self._edit_part_dialog())
+
+        # 우클릭 메뉴 (기존 유지)
         self.parts_menu = tk.Menu(self.app.root, tearoff=0)
-        self.parts_menu.add_command(label="수정", command=self._edit_part_dialog)
-        self.parts_menu.add_command(label="삭제", command=self._delete_part)
+        if Session.has_write("parts"):
+            self.parts_menu.add_command(label="✏️ 수정", command=self._edit_part_dialog)
+        if Session.has_write("parts"):
+            self.parts_menu.add_command(label="🗑️ 삭제", command=self._delete_part)
         self.parts_tree.bind("<Button-3>", self._parts_right_click)
+
+        # ── 인라인 액션 오버레이 (행 호버 시 우측에 ✏️ 🗑️ 표시) ──
+        self._action_overlay = tk.Frame(
+            card, bg="#f1f5f9", relief="solid", bd=1,
+            cursor="arrow"
+        )
+        btn_edit = tk.Label(
+            self._action_overlay, text="✏️", bg="#f1f5f9",
+            font=(FONT_FAMILY, 12), cursor="hand2", padx=6,
+        )
+        btn_edit.pack(side=tk.LEFT)
+        btn_del = tk.Label(
+            self._action_overlay, text="🗑️", bg="#f1f5f9",
+            font=(FONT_FAMILY, 12), cursor="hand2", padx=6,
+        )
+        btn_del.pack(side=tk.LEFT)
+
+        btn_edit.bind("<ButtonRelease-1>", lambda e: self._edit_part_dialog())
+        btn_del.bind("<ButtonRelease-1>",  lambda e: self._delete_part())
+
+        # 오버레이 위에 머물러도 숨기지 않음
+        self._action_overlay.bind("<Enter>", lambda e: None)
+        self._action_overlay.bind("<Leave>", lambda e: self._action_overlay.place_forget())
+        btn_edit.bind("<Enter>", lambda e: btn_edit.configure(bg="#dbeafe"))
+        btn_edit.bind("<Leave>", lambda e: btn_edit.configure(bg="#f1f5f9"))
+        btn_del.bind("<Enter>",  lambda e: btn_del.configure(bg="#fee2e2"))
+        btn_del.bind("<Leave>",  lambda e: btn_del.configure(bg="#f1f5f9"))
+
+        self.parts_tree.bind("<Motion>",  self._on_tree_hover)
+        self.parts_tree.bind("<Leave>",   lambda e: self._action_overlay.place_forget())
 
         self._load_parts_tree()
 
@@ -132,6 +185,32 @@ class PartsPage:
 
         threading.Thread(target=load, daemon=True).start()
 
+    def _on_tree_hover(self, event):
+        """행 위에 마우스가 있을 때 우측에 액션 버튼 오버레이 표시"""
+        if not self._action_overlay:
+            return
+        item = self.parts_tree.identify_row(event.y)
+        if not item:
+            self._action_overlay.place_forget()
+            return
+        bbox = self.parts_tree.bbox(item)
+        if not bbox:
+            self._action_overlay.place_forget()
+            return
+        _, row_y, _, row_h = bbox
+        tree_x = self.parts_tree.winfo_x()
+        tree_y = self.parts_tree.winfo_y()
+        tree_w = self.parts_tree.winfo_width()
+        overlay_w = 76
+        scrollbar_w = 18
+        x = tree_x + tree_w - overlay_w - scrollbar_w
+        y = tree_y + row_y
+        self._action_overlay.place(x=x, y=y, width=overlay_w, height=max(row_h, 24))
+        self._action_overlay.lift()
+        self._hovered_item = item
+        # 오버레이 선택 동기화
+        self.parts_tree.selection_set(item)
+
     def _parts_right_click(self, event):
         item = self.parts_tree.identify_row(event.y)
         if item:
@@ -141,7 +220,7 @@ class PartsPage:
     def _add_part_dialog(self):
         dialog = tk.Toplevel(self.app.root)
         dialog.title("부품 추가")
-        dialog.geometry("400x450")
+        self.app.center_dialog(dialog, 400, 450)
         dialog.resizable(False, False)
         dialog.transient(self.app.root)
         dialog.grab_set()
@@ -173,9 +252,11 @@ class PartsPage:
             except Exception as e:
                 messagebox.showerror("오류", str(e))
 
-        tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
-                  bg=COLORS["primary"], fg="white", padx=20, pady=5,
-                  command=save).grid(row=len(labels), column=0, columnspan=2, pady=15)
+        save_btn = tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                             bg=COLORS["primary"], fg="white", padx=20, pady=5,
+                             command=save)
+        save_btn.grid(row=len(labels), column=0, columnspan=2, pady=15)
+        dialog.bind("<Return>", lambda e: flash_btn(save_btn, save))
 
     def _edit_part_dialog(self):
         selected = self.parts_tree.selection()
@@ -185,7 +266,7 @@ class PartsPage:
 
         dialog = tk.Toplevel(self.app.root)
         dialog.title("부품 수정")
-        dialog.geometry("400x560")
+        self.app.center_dialog(dialog, 420, 640)
         dialog.resizable(False, False)
         dialog.transient(self.app.root)
         dialog.grab_set()
@@ -207,14 +288,41 @@ class PartsPage:
                 entry.configure(state="readonly")
             fields[label] = entry
 
+        # ── 단가 변경사유 (선택 입력) ──
+        sep_row = len(labels)
+        tk.Frame(dialog, height=1, bg=COLORS.get("border", "#e2e8f0")).grid(
+            row=sep_row, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 0))
+
+        reason_row = sep_row + 1
+        tk.Label(dialog, text="변경사유:",
+                 font=(FONT_FAMILY, FONT_SIZES["small"]),
+                 fg=COLORS.get("text_secondary", "#6b7280")).grid(
+            row=reason_row, column=0, padx=10, pady=5, sticky="e")
+        reason_entry = tk.Entry(dialog, font=(FONT_FAMILY, FONT_SIZES["small"]),
+                                width=30, fg="#374151")
+        reason_entry.grid(row=reason_row, column=1, padx=10, pady=5)
+        tk.Label(dialog, text="(단가 변경 시에만 기록됩니다. 선택 입력)",
+                 font=(FONT_FAMILY, 8), fg="#9ca3af").grid(
+            row=reason_row + 1, column=0, columnspan=2, pady=(0, 4))
+
         def save():
             try:
+                changed_by = ""
+                try:
+                    from core.auth import get_current_user
+                    user = get_current_user()
+                    changed_by = user.get("name", "") if user else ""
+                except Exception:
+                    pass
+
                 self.app.db.update_part(
                     fields["품번"].get().strip(), fields["부품명"].get().strip(),
                     fields["규격"].get().strip(), fields["단위"].get().strip(),
                     int(fields["현재재고"].get()), int(fields["안전재고"].get()),
                     fields["비고"].get().strip(), fields["업체명"].get().strip(),
                     float(fields["단가"].get() or 0), int(fields["MOQ"].get() or 0),
+                    changed_by=changed_by,
+                    change_reason=reason_entry.get().strip(),
                 )
                 messagebox.showinfo("성공", "부품 정보가 수정되었습니다.")
                 dialog.destroy()
@@ -222,9 +330,11 @@ class PartsPage:
             except Exception as e:
                 messagebox.showerror("오류", str(e))
 
-        tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
-                  bg=COLORS["primary"], fg="white", padx=20, pady=5,
-                  command=save).grid(row=len(labels), column=0, columnspan=2, pady=15)
+        save_btn = tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                             bg=COLORS["primary"], fg="white", padx=20, pady=5,
+                             command=save)
+        save_btn.grid(row=reason_row + 2, column=0, columnspan=2, pady=15)
+        dialog.bind("<Return>", lambda e: flash_btn(save_btn, save))
 
     def _delete_part(self):
         selected = self.parts_tree.selection()
@@ -284,13 +394,11 @@ class PartsPage:
         # 미리보기 대화상자
         preview = tk.Toplevel(self.app.root)
         preview.title("부품 대량 등록 미리보기")
-        screen_w = preview.winfo_screenwidth()
-        screen_h = preview.winfo_screenheight()
-        win_w = max(1000, int(screen_w * 0.7))
-        win_h = max(650, int(screen_h * 0.75))
-        x = (screen_w - win_w) // 2
-        y = (screen_h - win_h) // 2
-        preview.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        sw = self.app.root.winfo_screenwidth()
+        sh = self.app.root.winfo_screenheight()
+        win_w = max(1000, int(sw * 0.7))
+        win_h = max(650, int(sh * 0.75))
+        self.app.center_dialog(preview, win_w, win_h)
         preview.minsize(900, 600)
         preview.transient(self.app.root)
         preview.grab_set()

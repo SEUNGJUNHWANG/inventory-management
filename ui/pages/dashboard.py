@@ -23,7 +23,13 @@ class DashboardPage:
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        def _on_mw(e):
+            try:
+                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mw))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         # 타이틀
         tk.Label(scroll_frame, text="📊 대시보드", bg=COLORS["bg"], fg=COLORS["text"],

@@ -44,9 +44,15 @@ SHEET_PARTS    = "부품마스터"
 SHEET_PRODUCTS = "제품마스터"
 SHEET_BOM      = "BOM"
 SHEET_HISTORY  = "입출고이력"
+SHEET_USERS     = "사용자"
+SHEET_CUSTOMERS = "거래처"
+SHEET_SALES     = "판매이력"
+SHEET_MRP       = "MRP이력"
+SHEET_PRICE_LOG = "단가변경이력"
 
 # 캐시 유효 시간 (초)
-CACHE_TTL = 30
+CACHE_TTL         = 120   # 부품·제품·BOM: 2분
+CACHE_TTL_HISTORY = 60    # 이력: 1분 (쓰기 후 자동 무효화)
 
 # API 재시도 설정
 MAX_RETRIES   = 5          # 최대 재시도 횟수
@@ -112,11 +118,13 @@ class DataCache:
         self._timestamps = {}
         self._lock       = threading.Lock()
 
-    def get(self, key):
+    def get(self, key, ttl=None):
+        """캐시에서 데이터 조회. ttl 미지정 시 CACHE_TTL 사용."""
+        effective_ttl = ttl if ttl is not None else CACHE_TTL
         with self._lock:
             if key in self._cache:
                 elapsed = time.time() - self._timestamps.get(key, 0)
-                if elapsed < CACHE_TTL:
+                if elapsed < effective_ttl:
                     return self._cache[key]
             return None
 
@@ -181,9 +189,9 @@ class GoogleSheetsDB:
         # 부품마스터
         try:
             ws = self.spreadsheet.worksheet(SHEET_PARTS)
-            headers = ws.row_values(1)
+            headers = self._safe_row_values(ws, 1)
             if headers != NEW_PARTS_HEADERS:
-                all_data = ws.get_all_values()
+                all_data = self._safe_get_all_values(ws)
                 old_headers = all_data[0] if all_data else []
 
                 def get_col(h, row):
@@ -214,16 +222,31 @@ class GoogleSheetsDB:
 
         # 제품마스터
         try:
-            self.spreadsheet.worksheet(SHEET_PRODUCTS)
+            ws = self.spreadsheet.worksheet(SHEET_PRODUCTS)
+            prod_headers = self._safe_row_values(ws, 1)
+            if "판매가" not in prod_headers:
+                all_vals = self._safe_get_all_values(ws)
+                new_rows = []
+                for row in all_vals[1:]:
+                    while len(row) < 5:
+                        row.append("")
+                    new_row = [row[0], row[1], row[2], row[3], "0", row[4]]
+                    new_rows.append(new_row)
+                self._safe_update(ws, "A1:F1",
+                                  [["제품코드", "제품명", "규격", "현재재고", "판매가", "비고"]])
+                if new_rows:
+                    end_row = 1 + len(new_rows)
+                    self._safe_update(ws, f"A2:F{end_row}", new_rows)
+                self.cache.invalidate("products")
         except gspread.exceptions.WorksheetNotFound:
             ws = self.spreadsheet.add_worksheet(title=SHEET_PRODUCTS, rows=1000, cols=10)
-            self._safe_update(ws, "A1:E1",
-                              [["제품코드", "제품명", "규격", "현재재고", "비고"]])
+            self._safe_update(ws, "A1:F1",
+                              [["제품코드", "제품명", "규격", "현재재고", "판매가", "비고"]])
 
         # BOM
         try:
             ws = self.spreadsheet.worksheet(SHEET_BOM)
-            headers = ws.row_values(1)
+            headers = self._safe_row_values(ws, 1)
             if "단가" not in headers:
                 self._safe_update(ws, "A1:E1",
                                   [["제품코드", "부품품번", "소요량", "단가", "비고"]])
@@ -244,7 +267,53 @@ class GoogleSheetsDB:
                 "품명", "수량", "잔여재고", "관련제품", "비고"
             ]])
 
-        # 기본 Sheet1 삭제
+        # MRP이력 시트
+        MRP_HEADERS = ["저장ID", "저장일시", "계획명", "제품수", "안전재고반영", "생산계획", "소요부품"]
+        try:
+            self.spreadsheet.worksheet(SHEET_MRP)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(title=SHEET_MRP, rows=500, cols=10)
+            self._safe_update(ws, "A1:G1", [MRP_HEADERS])
+
+        # 사용자 시트
+        try:
+            self.spreadsheet.worksheet(SHEET_USERS)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(title=SHEET_USERS, rows=100, cols=5)
+            self._safe_update(ws, "A1:E1",
+                              [["아이디", "비밀번호", "이름", "메뉴권한", "활성화"]])
+            self._create_default_admin(ws)
+
+        # 거래처
+        try:
+            self.spreadsheet.worksheet(SHEET_CUSTOMERS)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(title=SHEET_CUSTOMERS, rows=500, cols=8)
+            self._safe_update(ws, "A1:G1", [[
+                "거래처코드", "거래처명", "담당자", "연락처", "이메일", "주소", "비고"
+            ]])
+
+        # 판매이력
+        try:
+            self.spreadsheet.worksheet(SHEET_SALES)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(title=SHEET_SALES, rows=10000, cols=12)
+            self._safe_update(ws, "A1:K1", [[
+                "판매번호", "일시", "제품코드", "제품명",
+                "거래처코드", "거래처명", "수량", "단가", "금액", "잔여재고", "비고"
+            ]])
+
+        # 단가변경이력 시트
+        PRICE_LOG_HEADERS = [
+            "변경일시", "품번", "부품명", "업체명",
+            "이전단가", "변경단가", "변경률", "변경자", "변경사유"
+        ]
+        try:
+            self.spreadsheet.worksheet(SHEET_PRICE_LOG)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(title=SHEET_PRICE_LOG, rows=5000, cols=10)
+            self._safe_update(ws, "A1:I1", [PRICE_LOG_HEADERS])
+
         try:
             self.spreadsheet.del_worksheet(
                 self.spreadsheet.worksheet("Sheet1")
@@ -262,6 +331,14 @@ class GoogleSheetsDB:
 
     @staticmethod
     @_retry_on_quota
+    def _safe_batch_update(ws, batch_data):
+        """여러 범위를 단 1번의 API 호출로 업데이트 (429 재시도 포함)
+        batch_data: [{"range": "A2:E2", "values": [[...]]}, ...]
+        """
+        ws.batch_update(batch_data)
+
+    @staticmethod
+    @_retry_on_quota
     def _safe_update_cell(ws, row, col, value):
         ws.update_cell(row, col, value)
 
@@ -274,6 +351,32 @@ class GoogleSheetsDB:
     @_retry_on_quota
     def _safe_append_row(ws, row):
         ws.append_row(row)
+
+    @staticmethod
+    @_retry_on_quota
+    def _safe_append_rows(ws, rows):
+        """여러 행을 한 번에 append. append_rows는 시트 행 수를 자동 확장하므로
+        grid limit 초과 오류(A{n}:E{m} exceeds grid limits)가 발생하지 않는다."""
+        ws.append_rows(rows, value_input_option="RAW")
+
+    # ── 읽기 API도 429 시 자동 재시도 ────────────────────────────────────────────
+    @staticmethod
+    @_retry_on_quota
+    def _safe_get_all_records(ws):
+        """get_all_records — 429 오류 시 자동 재시도"""
+        return ws.get_all_records()
+
+    @staticmethod
+    @_retry_on_quota
+    def _safe_get_all_values(ws):
+        """get_all_values — 429 오류 시 자동 재시도"""
+        return ws.get_all_values()
+
+    @staticmethod
+    @_retry_on_quota
+    def _safe_row_values(ws, row_num):
+        """row_values — 429 오류 시 자동 재시도"""
+        return ws.row_values(row_num)
 
     @staticmethod
     @_retry_on_quota
@@ -295,7 +398,7 @@ class GoogleSheetsDB:
         if cached is not None:
             return cached
         ws = self.spreadsheet.worksheet(SHEET_PARTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         self.cache.set("parts", records)
         return records
 
@@ -304,7 +407,7 @@ class GoogleSheetsDB:
         if cached is not None:
             return cached
         ws = self.spreadsheet.worksheet(SHEET_PRODUCTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         self.cache.set("products", records)
         return records
 
@@ -313,8 +416,18 @@ class GoogleSheetsDB:
         if cached is not None:
             return cached
         ws = self.spreadsheet.worksheet(SHEET_BOM)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         self.cache.set("bom", records)
+        return records
+
+    def _get_all_history_cached(self):
+        """입출고이력 캐시 조회 (TTL: 60초, 쓰기 시 자동 무효화)"""
+        cached = self.cache.get("history", ttl=CACHE_TTL_HISTORY)
+        if cached is not None:
+            return cached
+        ws = self.spreadsheet.worksheet(SHEET_HISTORY)
+        records = self._safe_get_all_records(ws)
+        self.cache.set("history", records)
         return records
 
     def _get_parts_map(self):
@@ -333,7 +446,7 @@ class GoogleSheetsDB:
     def _get_fresh_parts_map(self):
         """구글 시트에서 직접 최신 부품 데이터를 읽어 dict 반환 (캐시 우회)"""
         ws      = self.spreadsheet.worksheet(SHEET_PARTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         # 캐시도 함께 갱신하여 이후 일반 조회에도 최신 데이터가 반영되도록 함
         self.cache.set("parts",     records)
         parts_map = {str(p["품번"]): p for p in records}
@@ -343,7 +456,7 @@ class GoogleSheetsDB:
     def _get_fresh_product(self, product_id: str):
         """구글 시트에서 직접 최신 제품 데이터를 읽어 반환 (캐시 우회)"""
         ws      = self.spreadsheet.worksheet(SHEET_PRODUCTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         self.cache.set("products", records)
         for r in records:
             if str(r.get("제품코드", "")) == str(product_id):
@@ -353,7 +466,7 @@ class GoogleSheetsDB:
     def _get_fresh_bom_for_product(self, product_id: str):
         """구글 시트에서 직접 최신 BOM 데이터를 읽어 반환 (캐시 우회)"""
         ws      = self.spreadsheet.worksheet(SHEET_BOM)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         self.cache.set("bom", records)
         return [r for r in records if str(r.get("제품코드", "")) == str(product_id)]
 
@@ -413,20 +526,102 @@ class GoogleSheetsDB:
         self.cache.invalidate("parts_map")
 
     def update_part(self, part_id, name, spec, unit, qty, safety_qty,
-                    note="", supplier="", unit_price=0, moq=0):
+                    note="", supplier="", unit_price=0, moq=0,
+                    changed_by="", change_reason=""):
         ws      = self.spreadsheet.worksheet(SHEET_PARTS)
         records = ws.get_all_records()
         for i, r in enumerate(records):
             if str(r.get("품번", "")) == str(part_id):
+                old_price = float(r.get("단가", 0) or 0)
+                new_price = float(unit_price)
                 row = i + 2
                 self._safe_update(ws, f"A{row}:J{row}", [[
                     str(part_id), supplier, name, spec, unit,
-                    float(unit_price), int(qty), int(safety_qty), int(moq), note
+                    new_price, int(qty), int(safety_qty), int(moq), note
                 ]])
                 self.cache.invalidate("parts")
                 self.cache.invalidate("parts_map")
+                # 단가가 달라진 경우에만 이력 기록
+                if old_price != new_price:
+                    self._append_price_log(
+                        part_id=str(part_id),
+                        part_name=str(name),
+                        supplier=str(supplier),
+                        old_price=old_price,
+                        new_price=new_price,
+                        changed_by=changed_by,
+                        reason=change_reason,
+                    )
                 return True
         return False
+
+    def _append_price_log(self, part_id, part_name, supplier,
+                          old_price, new_price, changed_by="", reason=""):
+        """단가변경이력 시트에 1행 추가"""
+        try:
+            ws = self.spreadsheet.worksheet(SHEET_PRICE_LOG)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if old_price == 0:
+                rate_str = "신규"
+            else:
+                rate = (new_price - old_price) / old_price * 100
+                rate_str = f"{rate:+.1f}%"
+            self._safe_append_row(ws, [
+                now, part_id, part_name, supplier,
+                old_price, new_price, rate_str, changed_by, reason
+            ])
+        except Exception:
+            pass   # 이력 기록 실패는 메인 작업에 영향 없이 무시
+
+    def get_price_history(self, year=None, month=None, supplier=None):
+        """단가변경이력 조회 (연·월·업체 필터 선택적 적용)"""
+        ws      = self.spreadsheet.worksheet(SHEET_PRICE_LOG)
+        records = ws.get_all_records()
+        result  = []
+        for r in records:
+            dt_str = str(r.get("변경일시", ""))
+            if not dt_str:
+                continue
+            if year and not dt_str.startswith(str(year)):
+                continue
+            if month:
+                ym = f"{year}-{str(month).zfill(2)}"
+                if not dt_str.startswith(ym):
+                    continue
+            if supplier and supplier != "전체":
+                if str(r.get("업체명", "")) != supplier:
+                    continue
+            result.append({
+                "변경일시":  dt_str,
+                "품번":      str(r.get("품번", "")),
+                "부품명":    str(r.get("부품명", "")),
+                "업체명":    str(r.get("업체명", "")),
+                "이전단가":  float(r.get("이전단가", 0) or 0),
+                "변경단가":  float(r.get("변경단가", 0) or 0),
+                "변경률":    str(r.get("변경률", "")),
+                "변경자":    str(r.get("변경자", "")),
+                "변경사유":  str(r.get("변경사유", "")),
+            })
+        return result
+
+    def get_price_history_monthly_summary(self):
+        """최근 12개월 월별 변경 건수 요약 반환"""
+        from collections import defaultdict
+        ws      = self.spreadsheet.worksheet(SHEET_PRICE_LOG)
+        records = ws.get_all_records()
+        counts  = defaultdict(lambda: {"total": 0, "up": 0, "down": 0})
+        for r in records:
+            dt_str = str(r.get("변경일시", ""))
+            if len(dt_str) < 7:
+                continue
+            ym  = dt_str[:7]   # "YYYY-MM"
+            rate = str(r.get("변경률", ""))
+            counts[ym]["total"] += 1
+            if rate.startswith("+"):
+                counts[ym]["up"] += 1
+            elif rate.startswith("-"):
+                counts[ym]["down"] += 1
+        return dict(counts)
 
     def bulk_add_or_update_parts(self, parts_list, progress_callback=None):
         """
@@ -494,6 +689,8 @@ class GoogleSheetsDB:
                     return existing_val
             return s
 
+        price_log_batch = []   # 단가 변경 이력 배치 수집
+
         for p in parts_list:
             code = str(p["품번"])
             if code in existing_map:
@@ -501,6 +698,13 @@ class GoogleSheetsDB:
                 row = existing_rows[i2]
                 while len(row) < len(header):
                     row.append("")
+                # 단가 변경 전 이전값 기억
+                old_price_raw = get_cell(row, "단가")
+                try:
+                    old_price = float(old_price_raw) if old_price_raw else 0.0
+                except (ValueError, TypeError):
+                    old_price = 0.0
+
                 row[idx["업체명"]]  = merge_val(p.get("업체명", ""),  get_cell(row, "업체명"))
                 row[idx["부품명"]]  = merge_val(p.get("부품명", ""),  get_cell(row, "부품명"))
                 row[idx["규격"]]    = merge_val(p.get("규격", ""),    get_cell(row, "규격"))
@@ -512,6 +716,21 @@ class GoogleSheetsDB:
                 row[idx["비고"]]    = merge_val(p.get("비고", ""),    get_cell(row, "비고"))
                 existing_rows[i2]   = row
                 update_count        += 1
+
+                # 단가 변경 감지
+                new_price_raw = row[idx["단가"]]
+                try:
+                    new_price = float(new_price_raw) if new_price_raw else 0.0
+                except (ValueError, TypeError):
+                    new_price = 0.0
+                if old_price != new_price:
+                    price_log_batch.append({
+                        "part_id":   code,
+                        "part_name": str(row[idx["부품명"]]),
+                        "supplier":  str(row[idx["업체명"]]),
+                        "old_price": old_price,
+                        "new_price": new_price,
+                    })
             else:
                 new_row              = [""] * len(header)
                 new_row[idx["품번"]]   = code
@@ -545,6 +764,20 @@ class GoogleSheetsDB:
 
         self.cache.invalidate("parts")
         self.cache.invalidate("parts_map")
+
+        # 단가 변경 이력 일괄 기록 (엑셀 업로드)
+        for log in price_log_batch:
+            self._append_price_log(
+                part_id=log["part_id"],
+                part_name=log["part_name"],
+                supplier=log["supplier"],
+                old_price=log["old_price"],
+                new_price=log["new_price"],
+                changed_by="엑셀업로드",
+                reason="",
+            )
+            time.sleep(0.15)
+
         return new_count, update_count
 
     def delete_part(self, part_id: str):
@@ -572,9 +805,9 @@ class GoogleSheetsDB:
                 return r
         return None
 
-    def add_product(self, product_id, name, spec, qty=0, note=""):
+    def add_product(self, product_id, name, spec, qty=0, selling_price=0, note=""):
         ws = self.spreadsheet.worksheet(SHEET_PRODUCTS)
-        self._safe_append_row(ws, [str(product_id), name, spec, int(qty), note])
+        self._safe_append_row(ws, [str(product_id), name, spec, int(qty), float(selling_price), note])
         self.cache.invalidate("products")
 
     def update_product_qty(self, product_id: str, new_qty: int):
@@ -587,17 +820,30 @@ class GoogleSheetsDB:
                 return True
         return False
 
-    def update_product(self, product_id, name, spec, qty, note=""):
+    def update_product(self, product_id, name, spec, qty, selling_price=0, note=""):
         ws      = self.spreadsheet.worksheet(SHEET_PRODUCTS)
         records = ws.get_all_records()
         for i, r in enumerate(records):
             if str(r.get("제품코드", "")) == str(product_id):
                 row = i + 2
-                self._safe_update(ws, f"A{row}:E{row}",
-                                  [[str(product_id), name, spec, int(qty), note]])
+                self._safe_update(ws, f"A{row}:F{row}",
+                                  [[str(product_id), name, spec, int(qty), float(selling_price), note]])
                 self.cache.invalidate("products")
                 return True
         return False
+
+    def get_all_product_costs(self) -> dict:
+        """전체 제품의 원가를 {제품코드: 원가} 딕셔너리로 반환"""
+        all_bom   = self._get_all_bom_cached()
+        parts_map = self._get_parts_map()
+        costs: dict = {}
+        for r in all_bom:
+            pid   = str(r.get("제품코드", ""))
+            qty   = float(r.get("소요량", 0) or 0)
+            part  = parts_map.get(str(r.get("부품품번", "")), {})
+            price = float(part.get("단가", 0) or 0)
+            costs[pid] = costs.get(pid, 0.0) + qty * price
+        return costs
 
     def delete_product(self, product_id: str):
         ws      = self.spreadsheet.worksheet(SHEET_PRODUCTS)
@@ -662,6 +908,28 @@ class GoogleSheetsDB:
                 return True
         return False
 
+    def replace_bom_part(self, product_id: str, old_part_id: str,
+                         new_part_id: str, qty: float, note: str = ""):
+        """BOM 항목의 품번을 교체. 기존 행의 부품품번을 새 품번으로 변경."""
+        ws      = self.spreadsheet.worksheet(SHEET_BOM)
+        records = ws.get_all_records()
+        # 새 품번이 이미 같은 제품 BOM에 존재하는지 확인
+        for r in records:
+            if (str(r.get("제품코드", "")) == str(product_id) and
+                    str(r.get("부품품번", "")) == str(new_part_id)):
+                raise ValueError(f"품번 '{new_part_id}'은(는) 이미 이 제품의 BOM에 등록되어 있습니다.")
+        # 기존 행 찾아서 품번 포함 전체 업데이트
+        for i, r in enumerate(records):
+            if (str(r.get("제품코드", "")) == str(product_id) and
+                    str(r.get("부품품번", "")) == str(old_part_id)):
+                row = i + 2
+                self._safe_update(ws, f"A{row}:E{row}", [[
+                    str(product_id), str(new_part_id), float(qty), 0, note
+                ]])
+                self.cache.invalidate("bom")
+                return True
+        return False
+
     def delete_bom(self, product_id: str, part_id: str):
         ws      = self.spreadsheet.worksheet(SHEET_BOM)
         records = ws.get_all_records()
@@ -715,12 +983,11 @@ class GoogleSheetsDB:
                 new_count += 1
 
         # 신규 추가 (배치)
+        # append_rows 사용: 시트 행 수를 자동 확장하므로 grid limit 초과 오류 없음
         BATCH = 100
         for i in range(0, len(new_items), BATCH):
-            batch    = new_items[i:i + BATCH]
-            next_row = len(ws.get_all_values()) + 1
-            cell_range = f"A{next_row}:E{next_row + len(batch) - 1}"
-            self._safe_update(ws, cell_range, batch)
+            batch = new_items[i:i + BATCH]
+            self._safe_append_rows(ws, batch)
             if progress_callback:
                 progress_callback(
                     f"BOM 신규 등록 중... {min(i + BATCH, len(new_items))}/{len(new_items)}"
@@ -728,18 +995,21 @@ class GoogleSheetsDB:
             if i + BATCH < len(new_items):
                 time.sleep(2)  # 배치 간 딜레이
 
-        # 기존 수정 (배치)
-        UBATCH = 50
+        # 기존 수정: batch_update로 모든 행을 단 1번의 API 호출로 처리
+        UBATCH = 500
         for i in range(0, len(update_batches), UBATCH):
-            batch = update_batches[i:i + UBATCH]
-            for row_num, row_data in batch:
-                self._safe_update(ws, f"A{row_num}:E{row_num}", [row_data])
+            chunk = update_batches[i:i + UBATCH]
+            batch_data = [
+                {"range": f"A{row_num}:E{row_num}", "values": [row_data]}
+                for row_num, row_data in chunk
+            ]
+            self._safe_batch_update(ws, batch_data)
             if progress_callback:
                 progress_callback(
                     f"BOM 수정 중... {min(i + UBATCH, len(update_batches))}/{len(update_batches)}"
                 )
             if i + UBATCH < len(update_batches):
-                time.sleep(3)
+                time.sleep(1)
 
         self.cache.invalidate("bom")
         return new_count, update_count
@@ -811,23 +1081,25 @@ class GoogleSheetsDB:
             return True, (f"출고 완료: {part['부품명']} -{qty}개 "
                           f"(현재재고: {new_qty}개){warning}")
 
-    def produce_product(self, product_id: str, qty: int, note: str = ""):
+    def produce_product(self, product_id: str, qty: int, note: str = "", force: bool = False):
         """
         제품 생산 (BOM 기반 자동 출고)
         v2.1: 재고 수량 일괄 업데이트 + 이력 배치 추가
         문제 1 수정: 전체 생산 처리를 락으로 감싸 동시 재고 충돌 방지
+        force=True: 재고 부족 시에도 마이너스 처리 후 생산 진행
+        force=False(기본): 재고 부족 시 (None, 안내문, 부족목록) 반환 → UI에서 확인 후 재호출
         """
         with self._op_lock:
-            return self._produce_product_locked(product_id, qty, note)
+            return self._produce_product_locked(product_id, qty, note, force)
 
-    def _produce_product_locked(self, product_id: str, qty: int, note: str = ""):
+    def _produce_product_locked(self, product_id: str, qty: int, note: str = "", force: bool = False):
         """produce_product 내부 로직 — _op_lock 보유 상태에서 호출
         문제 2 수정: 재고 검증에 캐시 우회 메서드(_get_fresh_*)를 사용하여
         30초 캐시 TTL 만료나 동시 읽기에 의한 캐시 재채움에도 항상 최신 데이터 사용
         """
-        # 캐시 초기화 후 시트에서 직접 최신 데이터 읽기 (캐시 우회)
-        self.cache.invalidate_all()
-
+        # _get_fresh_* 메서드가 캐시를 우회해 시트에서 직접 읽으므로
+        # invalidate_all() 없이도 항상 최신 데이터를 사용합니다.
+        # (invalidate_all은 다른 시트 캐시까지 날려 불필요한 API 호출을 유발하므로 제거)
         product = self._get_fresh_product(product_id)
         if not product:
             return False, f"제품코드 '{product_id}'를 찾을 수 없습니다.", []
@@ -841,12 +1113,13 @@ class GoogleSheetsDB:
 
         # 1단계: 재고 검증
         shortage = []
+        missing_master = []
         for item in bom:
             part_id  = str(item["부품품번"])
             required = float(item["소요량"]) * int(qty)
             part     = parts_map.get(part_id)
             if not part:
-                shortage.append(f"품번 '{part_id}' 마스터 없음")
+                missing_master.append(f"품번 '{part_id}' 마스터 없음")
                 continue
             current = int(part["현재재고"])
             if current < required:
@@ -855,8 +1128,13 @@ class GoogleSheetsDB:
                     f"필요 {int(required)}개, 재고 {current}개"
                 )
 
-        if shortage:
-            return False, "재고 부족으로 생산 불가:\n" + "\n".join(shortage), []
+        # BOM 마스터 누락은 force 여부에 관계없이 항상 차단
+        if missing_master:
+            return False, "BOM 부품 마스터 오류:\n" + "\n".join(missing_master), []
+
+        # 재고 부족: force=False이면 확인 요청 반환, force=True이면 마이너스 처리 진행
+        if shortage and not force:
+            return None, "일부 부품 재고가 부족합니다:\n" + "\n".join(shortage), shortage
 
         # 2단계: 출고 처리 (일괄)
         results          = []
@@ -883,14 +1161,18 @@ class GoogleSheetsDB:
             })
 
             safety = int(part.get("안전재고", 0))
-            if safety > 0 and new_qty <= safety:
+            if new_qty < 0:
+                results.append(
+                    f"  🔴 {part['부품명']}({part_id}): -{required}개 → {new_qty}개 (마이너스 재고)"
+                )
+            elif safety > 0 and new_qty <= safety:
                 results.append(
                     f"  ⚠️ {part['부품명']}({part_id}): "
                     f"재고 {new_qty}개 (안전재고: {safety}개)"
                 )
             else:
                 results.append(
-                    f"  {part['부품명']}({part_id}): -{required}개 → {new_qty}개"
+                    f"  ✅ {part['부품명']}({part_id}): -{required}개 → {new_qty}개"
                 )
 
         self._bulk_update_part_qtys(qty_updates)
@@ -923,7 +1205,11 @@ class GoogleSheetsDB:
             item_name  = row_data[4]
             h_qty      = int(row_data[5])
 
-            self.cache.invalidate_all()
+            # 취소 시: 부품/제품 재고가 변하므로 해당 캐시만 무효화
+            self.cache.invalidate("parts")
+            self.cache.invalidate("parts_map")
+            self.cache.invalidate("products")
+            self.cache.invalidate("history")
 
             if h_type in ["부품입고"]:
                 part = self.get_part_by_id(item_id)
@@ -975,10 +1261,14 @@ class GoogleSheetsDB:
         product_name = row_data[4]
         prod_qty     = int(row_data[5])
 
-        self.cache.invalidate_all()
+        # 생산취소: 부품·제품 재고 + 이력이 변하므로 관련 캐시만 무효화
+        self.cache.invalidate("parts")
+        self.cache.invalidate("parts_map")
+        self.cache.invalidate("products")
+        self.cache.invalidate("history")
 
-        # 같은 시각 생산출고 이력 찾기
-        all_history      = ws.get_all_values()
+        # 같은 시각 생산출고 이력 찾기 (이력 시트 직접 읽기 — 취소 로직이므로 캐시 우회 OK)
+        all_history      = self._safe_get_all_values(ws)
         related_keyword  = f"{product_name}({product_id})"
 
         try:
@@ -1079,9 +1369,10 @@ class GoogleSheetsDB:
             now, direction, h_type, str(item_id),
             item_name, int(qty), int(remaining), related, note
         ])
+        self.cache.invalidate("history")   # 새 이력 추가 시 캐시 무효화
 
     def _add_history_batch(self, entries):
-        """이력 일괄 추가 (API 1회)"""
+        """이력 일괄 추가 (API 1회 — append_rows로 불필요한 읽기 제거)"""
         if not entries:
             return
         ws  = self.spreadsheet.worksheet(SHEET_HISTORY)
@@ -1093,13 +1384,13 @@ class GoogleSheetsDB:
                 e["item_name"], int(e["qty"]), int(e["remaining"]),
                 e.get("related", ""), e.get("note", "")
             ])
-        next_row   = len(ws.get_all_values()) + 1
-        cell_range = f"A{next_row}:I{next_row + len(rows) - 1}"
-        self._safe_update(ws, cell_range, rows)
+        # append_rows: 시트 끝에 자동 추가 — 행 수 파악을 위한 읽기 API 호출 불필요
+        self._safe_append_rows(ws, rows)
+        self.cache.invalidate("history")   # 이력 캐시 무효화
 
     def get_all_history(self):
-        ws = self.spreadsheet.worksheet(SHEET_HISTORY)
-        return ws.get_all_records()
+        """입출고이력 전체 조회 (캐시 사용, TTL 60초)"""
+        return self._get_all_history_cached()
 
     def get_history_by_date_range(self, start_date: str, end_date: str):
         records  = self.get_all_history()
@@ -1153,8 +1444,7 @@ class GoogleSheetsDB:
 
     def calculate_mrp(self, production_plan, include_safety_stock=False):
         """MRP(자재소요계획) 계산"""
-        self.cache.invalidate_all()
-
+        # 캐시된 메서드들이 TTL 내 최신 데이터를 반환하므로 invalidate_all 불필요
         products      = self._get_all_products_cached()
         products_map  = {str(p["제품코드"]): p for p in products}
         parts_map     = self._get_parts_map()
@@ -1179,7 +1469,8 @@ class GoogleSheetsDB:
                 "bottleneck":      bottleneck,
             })
 
-        part_totals = {}
+        part_totals      = {}
+        part_product_map = {}   # part_id → set of product_ids
         for plan_item in plan_summary:
             pid  = plan_item["product_id"]
             need = plan_item["need_to_produce"]
@@ -1192,6 +1483,9 @@ class GoogleSheetsDB:
                 req_per = float(bom_item.get("소요량", 0))
                 total   = req_per * need
                 part_totals[part_id] = part_totals.get(part_id, 0) + total
+                if part_id not in part_product_map:
+                    part_product_map[part_id] = set()
+                part_product_map[part_id].add(pid)
 
         parts_requirement = []
         total_order_items = 0
@@ -1217,11 +1511,14 @@ class GoogleSheetsDB:
                 "part_name":      part.get("부품명", ""),
                 "supplier":       part.get("업체명", ""),
                 "unit":           part.get("단위", ""),
+                "spec":           part.get("규격", ""),
+                "unit_price":     float(part.get("단가", 0) or 0),
                 "total_required": int(total_required),
                 "current_stock":  current_stock,
                 "safety_stock":   safety_stock,
                 "shortage":       int(shortage),
                 "order_needed":   order_needed,
+                "product_codes":  sorted(part_product_map.get(part_id, set())),
             })
 
         parts_requirement.sort(key=lambda x: (not x["order_needed"], x["part_id"]))
@@ -1232,3 +1529,443 @@ class GoogleSheetsDB:
             "total_order_items":   total_order_items,
             "total_order_qty":     total_order_qty,
         }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 거래처 관리
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def get_all_customers(self) -> list:
+        ws = self.spreadsheet.worksheet(SHEET_CUSTOMERS)
+        return ws.get_all_records()
+
+    def get_customer_by_code(self, code: str) -> dict | None:
+        rows = self.get_all_customers()
+        return next((r for r in rows if str(r.get("거래처코드", "")) == str(code)), None)
+
+    def add_customer(self, code: str, name: str, contact: str = "",
+                     phone: str = "", email: str = "",
+                     address: str = "", note: str = "") -> bool:
+        """거래처 추가. 중복 코드면 False 반환."""
+        if self.get_customer_by_code(code):
+            return False
+        ws = self.spreadsheet.worksheet(SHEET_CUSTOMERS)
+        self._safe_append_row(ws, [code, name, contact, phone, email, address, note])
+        return True
+
+    def update_customer(self, code: str, name: str, contact: str = "",
+                        phone: str = "", email: str = "",
+                        address: str = "", note: str = "") -> bool:
+        ws = self.spreadsheet.worksheet(SHEET_CUSTOMERS)
+        rows = ws.get_all_values()
+        headers = rows[0] if rows else []
+        try:
+            code_col = headers.index("거래처코드") + 1
+        except ValueError:
+            return False
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) >= code_col and str(row[code_col - 1]) == str(code):
+                self._safe_update(ws, f"A{i}:G{i}",
+                                  [[code, name, contact, phone, email, address, note]])
+                return True
+        return False
+
+    def delete_customer(self, code: str) -> bool:
+        ws = self.spreadsheet.worksheet(SHEET_CUSTOMERS)
+        rows = ws.get_all_values()
+        headers = rows[0] if rows else []
+        try:
+            code_col = headers.index("거래처코드") + 1
+        except ValueError:
+            return False
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) >= code_col and str(row[code_col - 1]) == str(code):
+                self._safe_delete_rows(ws, i)
+                return True
+        return False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 제품 출고(판매)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def ship_product(self, product_id: str, qty: int,
+                     customer_code: str, customer_name: str,
+                     unit_price: float, note: str = "") -> tuple:
+        """
+        제품 출고(판매) 처리
+        - 제품 재고 차감
+        - 판매이력 시트에 상세 기록
+        - 입출고이력 시트에도 기록
+        Returns: (success: bool, message: str)
+        """
+        with self._op_lock:
+            self.cache.invalidate("products")
+
+            product = self._get_fresh_product(product_id)
+            if not product:
+                return False, f"제품코드 '{product_id}'를 찾을 수 없습니다."
+
+            current = int(product.get("현재재고", 0))
+            if current < qty:
+                name = product.get("제품명", "")
+                return False, (
+                    f"재고 부족: [{name}] "
+                    f"현재재고 {current:,}개, 출고요청 {qty:,}개"
+                )
+
+            new_qty = current - qty
+            amount  = round(unit_price * qty)
+
+            # 1. 제품 재고 차감
+            self.update_product_qty(product_id, new_qty)
+
+            # 2. 판매이력 기록
+            ws_sales = self.spreadsheet.worksheet(SHEET_SALES)
+            all_rows = ws_sales.get_all_values()
+            sale_no  = len(all_rows)
+            now      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._safe_append_row(ws_sales, [
+                sale_no,
+                now,
+                str(product_id),
+                product.get("제품명", ""),
+                str(customer_code),
+                customer_name,
+                int(qty),
+                int(unit_price),
+                int(amount),
+                int(new_qty),
+                note,
+            ])
+
+            # 3. 기존 입출고이력에도 기록
+            self._add_history(
+                "출고", "제품출고",
+                product_id, product.get("제품명", ""),
+                qty, new_qty,
+                customer_name, note,
+            )
+
+            pname = product.get("제품명", "")
+            msg = (
+                f"[{pname}] {qty:,}개 납품 완료 ({customer_name})\n"
+                f"단가: {int(unit_price):,}원  x  {qty:,}개  =  {amount:,}원\n"
+                f"잔여재고: {new_qty:,}개"
+            )
+            return True, msg
+
+    def get_all_sales(self) -> list:
+        """판매이력 전체 조회"""
+        ws = self.spreadsheet.worksheet(SHEET_SALES)
+        return ws.get_all_records()
+
+    def get_sales_by_date_range(self, start_date: str, end_date: str) -> list:
+        """날짜 범위로 판매이력 필터링 (start/end: 'YYYY-MM-DD')"""
+        records = self.get_all_sales()
+        return [r for r in records
+                if start_date <= str(r.get("일시", ""))[:10] <= end_date]
+
+    def get_sales_summary_by_month(self) -> list:
+        """
+        월별 판매 집계 - 리포트용
+        Returns: [{"월": "2026-04", "건수": N, "수량": N, "금액": N}, ...]
+        """
+        records = self.get_all_sales()
+        monthly: dict = {}
+        for r in records:
+            month = str(r.get("일시", ""))[:7]
+            if not month or month == "":
+                continue
+            if month not in monthly:
+                monthly[month] = {"월": month, "건수": 0, "수량": 0, "금액": 0}
+            monthly[month]["건수"] += 1
+            monthly[month]["수량"] += int(r.get("수량", 0))
+            monthly[month]["금액"] += int(r.get("금액", 0))
+        return sorted(monthly.values(), key=lambda x: x["월"])
+
+
+    def _create_default_admin(self, ws=None):
+        """기본 관리자 계정 생성 (사용자 시트가 비어있을 때)"""
+        from core.auth import hash_password
+        from core.constants import (DEFAULT_ADMIN_ID, DEFAULT_ADMIN_PW,
+                                    DEFAULT_ADMIN_NAME, ALL_MENU_IDS)
+        if ws is None:
+            ws = self.spreadsheet.worksheet(SHEET_USERS)
+        all_menus = ",".join(ALL_MENU_IDS)
+        self._safe_append_row(ws, [
+            DEFAULT_ADMIN_ID,
+            hash_password(DEFAULT_ADMIN_PW),
+            DEFAULT_ADMIN_NAME,
+            all_menus,
+            "Y",
+        ])
+
+    def authenticate_user(self, username: str, password: str) -> dict | None:
+        """
+        아이디/비밀번호로 인증. 성공 시 사용자 dict 반환, 실패 시 None.
+        관리자(users 권한 보유) 로그인 시 새로 추가된 메뉴를 자동으로 권한에 추가.
+        """
+        from core.auth import verify_password
+        from core.constants import ALL_MENU_IDS
+        try:
+            ws      = self.spreadsheet.worksheet(SHEET_USERS)
+            records = ws.get_all_records()
+        except Exception:
+            return None
+
+        all_rows = ws.get_all_values()
+        headers  = all_rows[0] if all_rows else []
+
+        for row_idx, r in enumerate(records, start=2):
+            if (str(r.get("아이디", "")) == username
+                    and str(r.get("활성화", "Y")).upper() == "Y"):
+                stored_hash = str(r.get("비밀번호", ""))
+                if verify_password(password, stored_hash):
+                    menu_str = str(r.get("메뉴권한", ""))
+                    menus = [m.strip() for m in menu_str.split(",") if m.strip()]
+
+                    # 관리자(users 권한)는 새 메뉴 자동 추가
+                    if "users" in menus:
+                        new_menus = [m for m in ALL_MENU_IDS if m not in menus]
+                        if new_menus:
+                            menus = menus + new_menus
+                            # 시트에 자동 업데이트
+                            try:
+                                col_d = headers.index("메뉴권한") + 1 if "메뉴권한" in headers else 4
+                                col_letter = chr(ord("A") + col_d - 1)
+                                self._safe_update(
+                                    ws, f"{col_letter}{row_idx}",
+                                    [[",".join(menus)]]
+                                )
+                            except Exception:
+                                pass
+
+                    return {
+                        "아이디":   username,
+                        "이름":     str(r.get("이름", username)),
+                        "메뉴권한": menus,
+                    }
+        return None
+
+    # ═══════════════════════════════════════════════════════════════
+    # MRP 이력
+    # ═══════════════════════════════════════════════════════════════
+    def get_all_mrp_history(self) -> list:
+        """저장된 MRP 계획 이력 전체 조회 (최신순)"""
+        try:
+            ws  = self.spreadsheet.worksheet(SHEET_MRP)
+            rows = ws.get_all_records()
+            return list(reversed(rows))   # 최신순
+        except Exception:
+            return []
+
+    def save_mrp_plan(self, name: str, production_plan: list,
+                      mrp_result: dict, include_safety: bool) -> str:
+        """MRP 계획 저장 → 저장ID 반환.
+        소요부품(result_json)은 불러오기 시 재계산하므로 저장하지 않음.
+        (대용량 JSON을 단일 셀에 저장하면 Google Sheets 50,000자 제한 초과)
+        """
+        import json as _json
+        from datetime import datetime as _dt
+
+        ws   = self.spreadsheet.worksheet(SHEET_MRP)
+        rows = ws.get_all_values()
+        # ID 채번
+        existing_ids = [r[0] for r in rows[1:] if r and r[0].startswith("M-")]
+        if existing_ids:
+            nums  = [int(x.split("-")[1]) for x in existing_ids if x.split("-")[-1].isdigit()]
+            next_n = max(nums) + 1 if nums else 1
+        else:
+            next_n = 1
+        plan_id = f"M-{next_n:03d}"
+
+        plan_json  = _json.dumps(production_plan, ensure_ascii=False)
+        now_str    = _dt.now().strftime("%Y-%m-%d %H:%M")
+        prod_count = len(production_plan)
+
+        # G열(소요부품)은 빈 문자열로 — 재계산으로 대체
+        new_row = [plan_id, now_str, name, prod_count,
+                   "TRUE" if include_safety else "FALSE",
+                   plan_json, ""]
+        ws.append_row(new_row, value_input_option="RAW")
+        return plan_id
+
+    def update_mrp_plan(self, plan_id: str, name: str, production_plan: list,
+                        mrp_result: dict, include_safety: bool) -> bool:
+        """기존 MRP 계획 덮어쓰기 (내용 전체 수정).
+        계획을 못 찾으면 False 반환, 업데이트 중 오류는 예외를 그대로 올림.
+        소요부품(G열)은 재계산으로 대체하므로 저장하지 않음 — 50,000자 제한 방지.
+        """
+        import json as _json
+        from datetime import datetime as _dt
+
+        ws   = self.spreadsheet.worksheet(SHEET_MRP)
+        rows = ws.get_all_values()
+        for i, row in enumerate(rows[1:], 2):
+            if row and str(row[0]).strip() == str(plan_id).strip():
+                plan_json  = _json.dumps(production_plan, ensure_ascii=False)
+                now_str    = _dt.now().strftime("%Y-%m-%d %H:%M")
+                prod_count = len(production_plan)
+                # F열(생산계획)까지만 업데이트, G열(소요부품)은 건드리지 않음
+                self._safe_update(ws, f"B{i}:F{i}", [[
+                    now_str, name, prod_count,
+                    "TRUE" if include_safety else "FALSE",
+                    plan_json,
+                ]])
+                return True
+        return False   # plan_id 를 시트에서 찾지 못한 경우
+
+    def update_mrp_plan_name(self, plan_id: str, new_name: str) -> bool:
+        """MRP 계획명 수정"""
+        try:
+            ws   = self.spreadsheet.worksheet(SHEET_MRP)
+            rows = ws.get_all_values()
+            for i, row in enumerate(rows[1:], 2):
+                if row and row[0] == plan_id:
+                    ws.update_cell(i, 3, new_name)
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def delete_mrp_plans(self, plan_ids: list) -> int:
+        """MRP 계획 삭제 (복수). 삭제된 개수 반환"""
+        try:
+            ws   = self.spreadsheet.worksheet(SHEET_MRP)
+            rows = ws.get_all_values()
+            del_rows = []
+            for i, row in enumerate(rows[1:], 2):
+                if row and row[0] in plan_ids:
+                    del_rows.append(i)
+            # 역순으로 삭제 (행 번호 밀림 방지)
+            for row_idx in reversed(del_rows):
+                ws.delete_rows(row_idx)
+            return len(del_rows)
+        except Exception:
+            return 0
+
+    def get_mrp_plan_detail(self, plan_id: str) -> dict:
+        """저장된 MRP 계획 상세 조회 (불러오기용)"""
+        import json as _json
+        try:
+            ws   = self.spreadsheet.worksheet(SHEET_MRP)
+            rows = ws.get_all_records()
+            for row in rows:
+                if str(row.get("저장ID", "")) == plan_id:
+                    production_plan = _json.loads(row.get("생산계획", "[]"))
+                    include_safety  = str(row.get("안전재고반영", "FALSE")).upper() == "TRUE"
+                    return {
+                        "plan_id":        plan_id,
+                        "name":           row.get("계획명", ""),
+                        "saved_at":       row.get("저장일시", ""),
+                        "production_plan": production_plan,
+                        "include_safety": include_safety,
+                    }
+        except Exception:
+            pass
+        return {}
+
+    def get_all_users(self) -> list:
+        """전체 사용자 목록 반환 (비밀번호 제외)"""
+        try:
+            ws      = self.spreadsheet.worksheet(SHEET_USERS)
+            records = ws.get_all_records()
+        except Exception:
+            return []
+        result = []
+        for r in records:
+            menu_str = str(r.get("메뉴권한", ""))
+            menus = [m.strip() for m in menu_str.split(",") if m.strip()]
+            result.append({
+                "아이디":   str(r.get("아이디", "")),
+                "이름":     str(r.get("이름", "")),
+                "메뉴권한": menus,
+                "활성화":   str(r.get("활성화", "Y")).upper() == "Y",
+            })
+        return result
+
+    def add_user(self, username: str, password: str, name: str,
+                 menu_permissions: list, active: bool = True) -> bool:
+        """사용자 추가. 아이디 중복 시 False 반환"""
+        from core.auth import hash_password
+        existing = [u["아이디"] for u in self.get_all_users()]
+        if username in existing:
+            return False
+        ws = self.spreadsheet.worksheet(SHEET_USERS)
+        self._safe_append_row(ws, [
+            username,
+            hash_password(password),
+            name,
+            ",".join(menu_permissions),
+            "Y" if active else "N",
+        ])
+        return True
+
+    def update_user(self, username: str, name: str,
+                    menu_permissions: list, active: bool) -> bool:
+        """사용자 정보(이름·권한·활성화) 수정. 비밀번호는 별도 메서드로"""
+        try:
+            ws      = self.spreadsheet.worksheet(SHEET_USERS)
+            records = ws.get_all_records()
+        except Exception:
+            return False
+        for i, r in enumerate(records):
+            if str(r.get("아이디", "")) == username:
+                row = i + 2
+                # C(이름), D(메뉴권한), E(활성화) 만 업데이트
+                self._safe_update(ws, f"C{row}:E{row}", [[
+                    name,
+                    ",".join(menu_permissions),
+                    "Y" if active else "N",
+                ]])
+                return True
+        return False
+
+    def reset_password(self, username: str, new_password: str) -> bool:
+        """비밀번호 초기화"""
+        from core.auth import hash_password
+        try:
+            ws      = self.spreadsheet.worksheet(SHEET_USERS)
+            records = ws.get_all_records()
+        except Exception:
+            return False
+        for i, r in enumerate(records):
+            if str(r.get("아이디", "")) == username:
+                self._safe_update_cell(ws, i + 2, 2, hash_password(new_password))
+                return True
+        return False
+
+    def delete_user(self, username: str) -> bool:
+        """사용자 삭제 (마지막 관리자는 삭제 불가)"""
+        try:
+            ws      = self.spreadsheet.worksheet(SHEET_USERS)
+            records = ws.get_all_records()
+        except Exception:
+            return False
+        # 마지막 'users' 권한 보유자 삭제 방지
+        admin_rows = [
+            r for r in records
+            if "users" in str(r.get("메뉴권한", ""))
+               and str(r.get("활성화", "Y")).upper() == "Y"
+               and str(r.get("아이디", "")) != username
+        ]
+        target_row = None
+        for i, r in enumerate(records):
+            if str(r.get("아이디", "")) == username:
+                # 이 사용자가 마지막 관리자인지 확인
+                is_admin = "users" in str(r.get("메뉴권한", ""))
+                if is_admin and not admin_rows:
+                    return False  # 마지막 관리자 삭제 불가
+                target_row = i + 2
+                break
+        if target_row:
+            self._safe_delete_rows(ws, target_row)
+            return True
+        return False
+
+    def user_exists(self) -> bool:
+        """사용자 시트에 계정이 하나라도 있는지 확인"""
+        try:
+            ws = self.spreadsheet.worksheet(SHEET_USERS)
+            return len(ws.get_all_records()) > 0
+        except Exception:
+            return False

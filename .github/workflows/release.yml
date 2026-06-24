@@ -1,0 +1,46 @@
+name: Build and Release EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE with PyInstaller
+        run: |
+          python -m PyInstaller build.spec --noconfirm --clean
+
+      - name: Verify EXE exists
+        run: |
+          if (Test-Path "dist/재고관리시스템.exe") {
+            Write-Host "EXE build successful"
+          } else {
+            Write-Host "EXE not found!"
+            exit 1
+          }
+
+      - name: Upload EXE to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/재고관리시스템.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

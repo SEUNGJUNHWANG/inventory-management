@@ -12,7 +12,19 @@ from tkinter import ttk, messagebox, filedialog
 import threading
 import os
 from core.constants import COLORS, FONT_FAMILY, FONT_SIZES, BOM_COLUMNS
+from core.auth import Session
+from ui.widget_utils import flash_btn
 
+
+def _bind_tree_scroll(tree):
+    """Treeview에 마우스 휠 스크롤 바인딩 (hover 기반)"""
+    def _on_mw(e):
+        try:
+            tree.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        except Exception:
+            pass
+    tree.bind("<Enter>", lambda e: tree.bind_all("<MouseWheel>", _on_mw))
+    tree.bind("<Leave>", lambda e: tree.unbind_all("<MouseWheel>"))
 
 class BomPage:
     def __init__(self, app):
@@ -41,15 +53,16 @@ class BomPage:
                   bg="#059669", fg="white", padx=10, pady=4,
                   cursor="hand2", command=self._download_bom_template).pack(side=tk.LEFT, padx=3)
 
-        tk.Button(btn_frame, text="📄 엑셀 대량 등록",
-                  font=(FONT_FAMILY, FONT_SIZES["small"]),
-                  bg="#7c3aed", fg="white", padx=10, pady=4,
-                  cursor="hand2", command=self._bulk_upload_bom).pack(side=tk.LEFT, padx=3)
+        if Session.has_write("bom"):
+            tk.Button(btn_frame, text="📄 엑셀 대량 등록",
+                      font=(FONT_FAMILY, FONT_SIZES["small"]),
+                      bg="#7c3aed", fg="white", padx=10, pady=4,
+                      cursor="hand2", command=self._bulk_upload_bom).pack(side=tk.LEFT, padx=3)
 
-        tk.Button(btn_frame, text="+ BOM 추가",
-                  font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
-                  bg=COLORS["primary"], fg="white", padx=10, pady=4,
-                  cursor="hand2", command=self._add_bom_dialog).pack(side=tk.LEFT, padx=3)
+            tk.Button(btn_frame, text="+ BOM 추가",
+                      font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                      bg=COLORS["primary"], fg="white", padx=10, pady=4,
+                      cursor="hand2", command=self._add_bom_dialog).pack(side=tk.LEFT, padx=3)
 
         tk.Button(btn_frame, text="💰 전체 원가 요약",
                   font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
@@ -97,6 +110,7 @@ class BomPage:
             remaining = max(150, total - fixed)
             self.product_tree.column("제품명", width=remaining)
         self.product_tree.bind("<Configure>", _on_bom_tree_resize)
+        _bind_tree_scroll(self.product_tree)
 
         # 더블클릭 → 상세 명세 창
         self.product_tree.bind("<Double-1>", self._on_product_double_click)
@@ -106,7 +120,8 @@ class BomPage:
         self.product_menu.add_command(label="📋 부품 명세 보기", command=self._open_detail_from_menu)
         self.product_menu.add_command(label="💰 원가 분석", command=self._show_cost_from_menu)
         self.product_menu.add_separator()
-        self.product_menu.add_command(label="🗑️ 이 제품 BOM 전체 삭제", command=self._delete_product_bom)
+        if Session.has_write("bom"):
+            self.product_menu.add_command(label="🗑️ 이 제품 BOM 전체 삭제", command=self._delete_product_bom)
         self.product_tree.bind("<Button-3>", self._right_click_product)
 
         self._load_data()
@@ -205,13 +220,11 @@ class BomPage:
         dialog.grab_set()
 
         # 화면 크기의 70%로 설정
-        sw = dialog.winfo_screenwidth()
-        sh = dialog.winfo_screenheight()
+        sw = self.app.root.winfo_screenwidth()
+        sh = self.app.root.winfo_screenheight()
         dw = max(int(sw * 0.7), 900)
         dh = max(int(sh * 0.65), 550)
-        x = (sw - dw) // 2
-        y = (sh - dh) // 2
-        dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+        self.app.center_dialog(dialog, dw, dh)
         dialog.minsize(800, 500)
 
         # ── 헤더 영역 ──
@@ -343,7 +356,7 @@ class BomPage:
         """상세 창에서 특정 제품에 BOM 항목 추가"""
         dialog = tk.Toplevel(parent_dialog)
         dialog.title(f"BOM 추가 - {prod_code}")
-        dialog.geometry("450x250")
+        self.app.center_dialog(dialog, 450, 250, parent_dialog)
         dialog.resizable(False, False)
         dialog.transient(parent_dialog)
         dialog.grab_set()
@@ -387,12 +400,14 @@ class BomPage:
             except Exception as e:
                 messagebox.showerror("오류", str(e))
 
-        tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
-                  bg=COLORS["primary"], fg="white", padx=20, pady=5,
-                  command=save).grid(row=len(labels), column=0, columnspan=2, pady=15)
+        save_btn = tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                             bg=COLORS["primary"], fg="white", padx=20, pady=5,
+                             command=save)
+        save_btn.grid(row=len(labels), column=0, columnspan=2, pady=15)
+        dialog.bind("<Return>", lambda e: flash_btn(save_btn, save))
 
     def _edit_bom_in_detail(self, detail_tree, prod_code, parent_dialog):
-        """상세 테이블에서 BOM 항목 수정"""
+        """상세 테이블에서 BOM 항목 수정 (품번 변경 포함)"""
         selected = detail_tree.selection()
         if not selected:
             messagebox.showinfo("안내", "수정할 항목을 선택해 주세요.")
@@ -401,82 +416,192 @@ class BomPage:
         values = detail_tree.item(selected[0])["values"]
         part_code = str(values[1])
         part_name = str(values[2])
-        current_qty = str(values[6])  # 업체명 추가로 인덱스 +1
-        current_price = str(values[8]).replace(",", "").replace("-", "0")
+        current_qty = str(values[6])
         current_note = str(values[10]) if len(values) > 10 else ""
 
         dialog = tk.Toplevel(parent_dialog)
         dialog.title(f"BOM 수정 - {part_name}")
-        dialog.geometry("500x360")
+        self.app.center_dialog(dialog, 520, 430, parent_dialog)
         dialog.resizable(False, False)
         dialog.transient(parent_dialog)
         dialog.grab_set()
 
-        # 부품 정보 (읽기 전용)
+        # 제품 정보
         info_frame = tk.Frame(dialog, bg=COLORS["bg"], padx=15, pady=10)
         info_frame.pack(fill=tk.X)
-
         prod_name = self.products_map.get(prod_code, {}).get("제품명", "?")
         tk.Label(info_frame, text=f"제품: {prod_code} - {prod_name}",
                  bg=COLORS["bg"], fg=COLORS["text"],
                  font=(FONT_FAMILY, FONT_SIZES["body"], "bold")).pack(anchor="w")
-        tk.Label(info_frame, text=f"부품: {part_code} - {part_name}",
+        tk.Label(info_frame, text=f"현재 부품: {part_code} - {part_name}",
                  bg=COLORS["bg"], fg=COLORS["text_secondary"],
                  font=(FONT_FAMILY, FONT_SIZES["small"])).pack(anchor="w", pady=(2, 0))
 
-        # 수정 필드
+        # 구분선
+        tk.Frame(dialog, bg=COLORS["border"], height=1).pack(fill=tk.X, padx=15)
+
         edit_frame = tk.Frame(dialog, padx=15, pady=10)
         edit_frame.pack(fill=tk.X)
+        edit_frame.columnconfigure(1, weight=1)
 
-        tk.Label(edit_frame, text="소요량:", font=(FONT_FAMILY, FONT_SIZES["body"])).grid(
-            row=0, column=0, padx=5, pady=8, sticky="e")
-        qty_entry = tk.Entry(edit_frame, font=(FONT_FAMILY, FONT_SIZES["body"]), width=20)
-        qty_entry.grid(row=0, column=1, padx=5, pady=8)
+        # ── 품번 변경 ──
+        tk.Label(edit_frame, text="품번 변경:",
+                 font=(FONT_FAMILY, FONT_SIZES["body"])).grid(
+            row=0, column=0, padx=5, pady=6, sticky="e")
+
+        part_search_var = tk.StringVar(value=part_code)
+        selected_new_part = {"code": part_code, "name": part_name}   # dict로 변경 추적
+
+        part_entry_frame = tk.Frame(edit_frame)
+        part_entry_frame.grid(row=0, column=1, padx=5, pady=6, sticky="w")
+
+        part_entry = tk.Entry(part_entry_frame, textvariable=part_search_var,
+                              font=(FONT_FAMILY, FONT_SIZES["body"]), width=22)
+        part_entry.pack(side=tk.LEFT)
+
+        new_part_label = tk.Label(part_entry_frame, text=f"({part_name})",
+                                   font=(FONT_FAMILY, FONT_SIZES["small"]),
+                                   fg=COLORS["info"])
+        new_part_label.pack(side=tk.LEFT, padx=(6, 0))
+
+        # 자동완성 팝업
+        ac_frame = tk.Frame(dialog, bg="white",
+                             highlightbackground=COLORS["border"], highlightthickness=1)
+        ac_listbox = tk.Listbox(ac_frame, font=(FONT_FAMILY, FONT_SIZES["small"]),
+                                height=6, width=50,
+                                selectbackground=COLORS["primary"], selectforeground="white",
+                                activestyle="none", cursor="hand2")
+        ac_listbox.pack(fill=tk.BOTH, expand=True)
+
+        all_parts = self.app.db.get_all_parts()   # 전체 부품 목록
+
+        def _show_ac(parts_list):
+            ac_listbox.delete(0, tk.END)
+            if not parts_list:
+                ac_frame.place_forget()
+                return
+            for p in parts_list[:12]:
+                code = str(p.get("품번", ""))
+                name = str(p.get("부품명", ""))
+                ac_listbox.insert(tk.END, f"{code}  |  {name}")
+            # part_entry 위치 기준으로 드롭다운 표시
+            ac_frame.lift()
+            ac_frame.place(in_=part_entry, x=0, y=part_entry.winfo_height(),
+                            width=360)
+
+        def _hide_ac():
+            ac_frame.place_forget()
+
+        def _on_part_key(event=None):
+            if event and event.keysym == "Escape":
+                _hide_ac(); return
+            if event and event.keysym == "Down":
+                ac_listbox.focus_set()
+                if ac_listbox.size() > 0:
+                    ac_listbox.selection_set(0)
+                return
+            kw = part_search_var.get().strip().lower()
+            filtered = [p for p in all_parts
+                        if kw in str(p.get("품번", "")).lower()
+                        or kw in str(p.get("부품명", "")).lower()] if kw else all_parts[:12]
+            _show_ac(filtered[:12])
+
+        def _on_ac_select(event=None):
+            sel = ac_listbox.curselection()
+            if not sel:
+                return
+            kw = part_search_var.get().strip().lower()
+            filtered = [p for p in all_parts
+                        if kw in str(p.get("품번", "")).lower()
+                        or kw in str(p.get("부품명", "")).lower()] if kw else all_parts[:12]
+            idx = sel[0]
+            if idx < len(filtered):
+                p = filtered[idx]
+                selected_new_part["code"] = str(p.get("품번", ""))
+                selected_new_part["name"] = str(p.get("부품명", ""))
+                part_search_var.set(selected_new_part["code"])
+                new_part_label.config(text=f"({selected_new_part['name']})")
+                _hide_ac()
+                qty_entry.focus_set()
+                _update_price()
+
+        part_entry.bind("<KeyRelease>", _on_part_key)
+        part_entry.bind("<FocusIn>", _on_part_key)
+        ac_listbox.bind("<<ListboxSelect>>", _on_ac_select)
+        ac_listbox.bind("<Double-Button-1>", _on_ac_select)
+        dialog.bind("<Button-1>", lambda e: _hide_ac() if e.widget not in (part_entry, ac_listbox) else None)
+
+        # ── 소요량 ──
+        tk.Label(edit_frame, text="소요량:",
+                 font=(FONT_FAMILY, FONT_SIZES["body"])).grid(
+            row=1, column=0, padx=5, pady=6, sticky="e")
+        qty_entry = tk.Entry(edit_frame, font=(FONT_FAMILY, FONT_SIZES["body"]), width=22)
+        qty_entry.grid(row=1, column=1, padx=5, pady=6, sticky="w")
         qty_entry.insert(0, current_qty)
 
-        # 단가 조회 (참고용 표시만, 수정은 부품관리에서)
-        part_info_for_price = self.app.db.get_part_by_id(part_code)
-        auto_price_val = float(part_info_for_price.get("단가", 0) or 0) if part_info_for_price else 0
+        # ── 단가 참고 ──
+        price_label = tk.Label(edit_frame, text="",
+                                font=(FONT_FAMILY, FONT_SIZES["small"]), fg="#6b7280")
+        price_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=2)
 
-        price_info_frame = tk.Frame(edit_frame)
-        price_info_frame.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=4)
-        tk.Label(price_info_frame,
-                 text=f"단가: {auto_price_val:,.0f}원  (부품마스터 기준 / 변경은 부품관리 메뉴에서)",
-                 font=(FONT_FAMILY, FONT_SIZES["small"]), fg="#6b7280").pack(side=tk.LEFT)
+        def _update_price():
+            code = selected_new_part["code"]
+            info = self.app.db.get_part_by_id(code)
+            price = float(info.get("단가", 0) or 0) if info else 0
+            price_label.config(text=f"단가: {price:,.0f}원  (부품마스터 기준 / 변경은 부품관리 메뉴에서)")
+            return price
 
-        tk.Label(edit_frame, text="비고:", font=(FONT_FAMILY, FONT_SIZES["body"])).grid(
-            row=2, column=0, padx=5, pady=8, sticky="e")
-        note_entry = tk.Entry(edit_frame, font=(FONT_FAMILY, FONT_SIZES["body"]), width=20)
-        note_entry.grid(row=2, column=1, padx=5, pady=8)
-        note_entry.insert(0, current_note)
+        current_price_val = _update_price()
 
-        # 소계 미리보기
+        # ── 소계 미리보기 ──
         subtotal_label = tk.Label(edit_frame, text="", fg=COLORS["primary"],
                                    font=(FONT_FAMILY, FONT_SIZES["body"], "bold"))
-        subtotal_label.grid(row=3, column=0, columnspan=2, pady=5)
+        subtotal_label.grid(row=3, column=0, columnspan=2, pady=4)
 
-        def update_subtotal(*args):
+        def _update_subtotal(*_):
             try:
+                info = self.app.db.get_part_by_id(selected_new_part["code"])
+                price = float(info.get("단가", 0) or 0) if info else 0
                 q = float(qty_entry.get() or 0)
-                subtotal_label.config(text=f"소계(참고): {q * auto_price_val:,.0f}원")
+                subtotal_label.config(text=f"소계(참고): {q * price:,.0f}원")
             except:
                 subtotal_label.config(text="")
 
-        qty_entry.bind("<KeyRelease>", update_subtotal)
-        update_subtotal()
+        qty_entry.bind("<KeyRelease>", _update_subtotal)
+        _update_subtotal()
+
+        # ── 비고 ──
+        tk.Label(edit_frame, text="비고:",
+                 font=(FONT_FAMILY, FONT_SIZES["body"])).grid(
+            row=4, column=0, padx=5, pady=6, sticky="e")
+        note_entry = tk.Entry(edit_frame, font=(FONT_FAMILY, FONT_SIZES["body"]), width=22)
+        note_entry.grid(row=4, column=1, padx=5, pady=6, sticky="w")
+        note_entry.insert(0, current_note)
 
         def save():
             try:
                 new_qty = float(qty_entry.get())
                 new_note = note_entry.get().strip()
+                new_part_code = selected_new_part["code"].strip()
 
                 if new_qty <= 0:
                     messagebox.showwarning("입력 오류", "소요량은 0보다 커야 합니다.")
                     return
+                if not new_part_code:
+                    messagebox.showwarning("입력 오류", "품번을 입력하거나 목록에서 선택해 주세요.")
+                    return
 
-                # 단가는 부품마스터에서만 관리 — BOM에 별도 저장하지 않음
-                self.app.db.update_bom(prod_code, part_code, new_qty, new_note)
-                messagebox.showinfo("성공", "BOM 항목이 수정되었습니다.")
+                if new_part_code != part_code:
+                    # 품번이 변경된 경우 → replace_bom_part
+                    self.app.db.replace_bom_part(
+                        prod_code, part_code, new_part_code, new_qty, new_note)
+                    messagebox.showinfo("성공",
+                        f"품번이 '{part_code}' → '{new_part_code}'으로 변경되었습니다.")
+                else:
+                    # 품번 동일 → 소요량/비고만 수정
+                    self.app.db.update_bom(prod_code, part_code, new_qty, new_note)
+                    messagebox.showinfo("성공", "BOM 항목이 수정되었습니다.")
+
                 dialog.destroy()
                 parent_dialog.destroy()
                 self._load_data()
@@ -486,7 +611,6 @@ class BomPage:
 
         btn_frame = tk.Frame(dialog, padx=15, pady=10)
         btn_frame.pack(fill=tk.X)
-
         tk.Button(btn_frame, text="취소", font=(FONT_FAMILY, FONT_SIZES["small"]),
                   padx=15, pady=5, command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
         tk.Button(btn_frame, text="💾 저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
@@ -626,13 +750,11 @@ class BomPage:
         dialog.grab_set()
 
         # 화면 크기의 75%로 설정
-        sw = dialog.winfo_screenwidth()
-        sh = dialog.winfo_screenheight()
+        sw = self.app.root.winfo_screenwidth()
+        sh = self.app.root.winfo_screenheight()
         dw = max(int(sw * 0.75), 900)
         dh = max(int(sh * 0.75), 600)
-        x = (sw - dw) // 2
-        y = (sh - dh) // 2
-        dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+        self.app.center_dialog(dialog, dw, dh)
         dialog.minsize(900, 600)
 
         # ── 미등록 항목 검증 ──
@@ -822,7 +944,7 @@ class BomPage:
     def _add_bom_dialog(self):
         dialog = tk.Toplevel(self.app.root)
         dialog.title("BOM 추가")
-        dialog.geometry("450x320")
+        self.app.center_dialog(dialog, 450, 320)
         dialog.resizable(False, False)
         dialog.transient(self.app.root)
         dialog.grab_set()
@@ -870,9 +992,11 @@ class BomPage:
             except Exception as e:
                 messagebox.showerror("오류", str(e))
 
-        tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
-                  bg=COLORS["primary"], fg="white", padx=20, pady=5,
-                  command=save).grid(row=len(labels), column=0, columnspan=2, pady=15)
+        save_btn2 = tk.Button(dialog, text="저장", font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
+                              bg=COLORS["primary"], fg="white", padx=20, pady=5,
+                              command=save)
+        save_btn2.grid(row=len(labels), column=0, columnspan=2, pady=15)
+        dialog.bind("<Return>", lambda e: flash_btn(save_btn2, save))
 
     # ─────────────────────────────────────────
     # 제품별 원가 분석
@@ -893,7 +1017,7 @@ class BomPage:
         def show(total_cost, details):
             dialog = tk.Toplevel(self.app.root)
             dialog.title(f"💰 원가 분석 - {product_name}")
-            dialog.geometry("700x500")
+            self.app.center_dialog(dialog, 700, 500)
             dialog.transient(self.app.root)
             dialog.grab_set()
 
@@ -963,7 +1087,7 @@ class BomPage:
         def show(summary):
             dialog = tk.Toplevel(self.app.root)
             dialog.title("💰 전체 제품 원가 요약")
-            dialog.geometry("600x450")
+            self.app.center_dialog(dialog, 600, 450)
             dialog.transient(self.app.root)
             dialog.grab_set()
 
@@ -993,12 +1117,7 @@ class BomPage:
             for s in summary:
                 tree.insert("", "end", values=(
                     s["제품코드"], s["제품명"],
-                    f"{s['원가']:,.0f}원" if s["원가"] > 0 else "미설정"
+                    f"{s['원가']:,.0f}원" if s["원가"] > 0 else "미설정",
                 ))
-
-            tree.pack(fill=tk.BOTH, expand=True)
-
-            tk.Button(dialog, text="닫기", font=(FONT_FAMILY, FONT_SIZES["small"]),
-                      padx=15, pady=5, command=dialog.destroy).pack(pady=10)
 
         threading.Thread(target=load, daemon=True).start()

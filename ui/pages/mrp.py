@@ -13,6 +13,7 @@ import threading
 import os
 from datetime import datetime
 from core.constants import COLORS, FONT_FAMILY, FONT_SIZES
+from ui.widget_utils import flash_btn
 
 
 class MrpPage:
@@ -23,6 +24,11 @@ class MrpPage:
         self.production_plan = []  # [{"product_id", "product_name", "target_qty"}, ...]
         self.mrp_result = None
         self.products_cache = []
+        self.checked_ids  = set()
+        self.hist_checked = set()
+        self.history_tree = None
+        self.loaded_plan_id   = None   # 불러온 계획의 ID (덮어쓰기 판별용)
+        self.loaded_plan_name = None   # 불러온 계획명 (기본값 표시용)
 
     def render(self):
         """페이지 렌더링"""
@@ -47,10 +53,14 @@ class MrpPage:
 
         # ── 4. 결과 영역 (계산 후 표시) ──
         self.result_frame = tk.Frame(self.scroll_frame, bg=COLORS["bg"])
-        self.result_frame.pack(fill=tk.BOTH, expand=True, padx=5)
+        self.result_frame.pack(fill=tk.X, padx=5)
+
+        # ── 5. 저장된 MRP 계획 이력 목록 ──
+        self._build_history_card()
 
         # 제품 목록 캐시 로드
         self._load_products_cache()
+        self._load_history()
 
     # ═══════════════════════════════════════════
     # 1. 생산 계획 입력 카드
@@ -146,62 +156,82 @@ class MrpPage:
         header = tk.Frame(card, bg=COLORS["card_bg"])
         header.pack(fill=tk.X, padx=15, pady=(12, 5))
 
-        tk.Label(header, text="생산 계획 목록",
+        left_hdr = tk.Frame(header, bg=COLORS["card_bg"])
+        left_hdr.pack(side=tk.LEFT)
+        tk.Label(left_hdr, text="생산 계획 목록",
                  bg=COLORS["card_bg"], fg=COLORS["text"],
                  font=(FONT_FAMILY, FONT_SIZES["heading"], "bold")).pack(side=tk.LEFT)
-
-        self.plan_count_label = tk.Label(header, text="(0개 제품)",
+        self.plan_count_label = tk.Label(left_hdr, text="(0개 제품)",
                                           bg=COLORS["card_bg"], fg=COLORS["text_secondary"],
                                           font=(FONT_FAMILY, FONT_SIZES["small"]))
-        self.plan_count_label.pack(side=tk.LEFT, padx=10)
-
-        tk.Button(header, text="🗑 전체 삭제",
+        self.plan_count_label.pack(side=tk.LEFT, padx=8)
+        tk.Button(left_hdr, text="전체 선택",
                   font=(FONT_FAMILY, FONT_SIZES["small"]),
-                  bg=COLORS["danger"], fg="white",
-                  padx=8, pady=2, cursor="hand2",
-                  command=self._clear_plan).pack(side=tk.RIGHT)
+                  bg="#e2e8f0", fg=COLORS["text"], padx=6, pady=1, cursor="hand2",
+                  command=self._select_all_plan).pack(side=tk.LEFT, padx=(12, 2))
+        tk.Button(left_hdr, text="전체 해제",
+                  font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg="#e2e8f0", fg=COLORS["text"], padx=6, pady=1, cursor="hand2",
+                  command=self._deselect_all_plan).pack(side=tk.LEFT, padx=2)
 
-        # 트리뷰
+        right_hdr = tk.Frame(header, bg=COLORS["card_bg"])
+        right_hdr.pack(side=tk.RIGHT)
+        tk.Button(right_hdr, text="수량 수정",
+                  font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg="#0ea5e9", fg="white", padx=8, pady=2, cursor="hand2",
+                  command=self._edit_qty_dialog).pack(side=tk.LEFT, padx=2)
+        tk.Button(right_hdr, text="선택 삭제",
+                  font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg=COLORS["warning"], fg="white", padx=8, pady=2, cursor="hand2",
+                  command=self._delete_checked_plans).pack(side=tk.LEFT, padx=2)
+        tk.Button(right_hdr, text="전체 삭제",
+                  font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg=COLORS["danger"], fg="white", padx=8, pady=2, cursor="hand2",
+                  command=self._clear_plan).pack(side=tk.LEFT, padx=(2, 0))
+
         tree_frame = tk.Frame(card, bg=COLORS["card_bg"])
         tree_frame.pack(fill=tk.X, padx=15, pady=(0, 12))
 
-        columns = ("no", "product_id", "product_name", "current_stock",
+        columns = ("check", "no", "product_id", "product_name", "current_stock",
                     "target_qty", "need_produce", "max_producible", "bottleneck")
         self.plan_tree = ttk.Treeview(tree_frame, columns=columns,
                                        show="headings", height=5)
 
         col_config = [
-            ("no", "No", 40, "center"),
-            ("product_id", "제품코드", 100, "center"),
-            ("product_name", "제품명", 150, "w"),
-            ("current_stock", "현재재고", 80, "center"),
-            ("target_qty", "목표수량", 80, "center"),
-            ("need_produce", "추가생산필요", 100, "center"),
-            ("max_producible", "최대생산가능", 100, "center"),
-            ("bottleneck", "병목부품", 150, "w"),
+            ("check",          "V",            36,  "center"),
+            ("no",             "No",            36,  "center"),
+            ("product_id",     "제품코드",     100,  "center"),
+            ("product_name",   "제품명",       150,  "w"),
+            ("current_stock",  "현재재고",      80,  "center"),
+            ("target_qty",     "목표수량",      80,  "center"),
+            ("need_produce",   "추가생산필요", 100,  "center"),
+            ("max_producible", "최대생산가능", 100,  "center"),
+            ("bottleneck",     "병목부품",     150,  "w"),
         ]
-
         for col_id, heading, width, anchor in col_config:
             self.plan_tree.heading(col_id, text=heading)
-            self.plan_tree.column(col_id, width=width, anchor=anchor)
+            self.plan_tree.column(col_id, width=width, anchor=anchor,
+                                   minwidth=width if col_id in ("check","no") else 30,
+                                   stretch=(col_id not in ("check","no")))
 
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.plan_tree.yview)
         self.plan_tree.configure(yscrollcommand=scrollbar.set)
         self.plan_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 반응형: 제품명/병목부품 컬럼 자동 조정
         def _on_plan_resize(event):
             total = self.plan_tree.winfo_width()
-            fixed = 40 + 100 + 80 + 80 + 100 + 100 + 20  # No+코드+현재재고+목표+추가생산+최대+스크롤바
+            fixed = 36+36+100+80+80+100+100+20
             remaining = max(200, total - fixed)
             self.plan_tree.column("product_name", width=int(remaining * 0.55))
-            self.plan_tree.column("bottleneck", width=int(remaining * 0.45))
+            self.plan_tree.column("bottleneck",   width=int(remaining * 0.45))
         self.plan_tree.bind("<Configure>", _on_plan_resize)
+        self.plan_tree.bind("<ButtonRelease-1>", self._on_plan_click)
 
-        # 우클릭 메뉴
         self.plan_menu = tk.Menu(self.plan_tree, tearoff=0)
-        self.plan_menu.add_command(label="선택 항목 삭제", command=self._delete_selected_plan)
+        self.plan_menu.add_command(label="수량 수정",  command=self._edit_qty_dialog)
+        self.plan_menu.add_separator()
+        self.plan_menu.add_command(label="이 항목 삭제", command=self._delete_selected_plan)
         self.plan_tree.bind("<Button-3>", self._show_plan_menu)
 
     # ═══════════════════════════════════════════
@@ -425,13 +455,14 @@ class MrpPage:
             current_stock = int(product["현재재고"]) if product else 0
             need          = max(0, plan["target_qty"] - current_stock)
 
+            chk = "[v]" if pid in self.checked_ids else "[ ]"
             tag = "need" if need > 0 else "ok"
             self.plan_tree.insert("", tk.END, values=(
-                i, pid, plan["product_name"],
+                chk, i, pid, plan["product_name"],
                 f"{current_stock}개", f"{plan['target_qty']}개",
                 f"{need}개" if need > 0 else "충분",
-                "계산 전",   # 최대생산가능 — 소요량 계산 후 갱신
-                "계산 전"    # 병목부품     — 소요량 계산 후 갱신
+                "계산 전",
+                "계산 전"
             ), tags=(tag,))
 
         self.plan_tree.tag_configure("need", foreground=COLORS["danger"])
@@ -445,7 +476,7 @@ class MrpPage:
         if not selected:
             return
         values = self.plan_tree.item(selected[0])["values"]
-        product_id = str(values[1])
+        product_id = str(values[2])  # check 컬럼 추가로 인덱스 2
 
         self.production_plan = [p for p in self.production_plan if p["product_id"] != product_id]
         self._refresh_plan_tree()
@@ -458,16 +489,502 @@ class MrpPage:
             self.plan_menu.post(event.x_root, event.y_root)
 
     def _clear_plan(self):
-        """전체 계획 삭제"""
+        """전체 계획 삭제 및 초기화"""
         if not self.production_plan:
+            messagebox.showinfo("알림", "계획 목록이 이미 비어 있습니다.")
             return
-        if messagebox.askyesno("확인", "생산 계획 목록을 전체 삭제하시겠습니까?"):
+        if messagebox.askyesno("초기화 확인", "생산 계획 목록 전체를 삭제하고 새로 시작하시겠습니까?"):
             self.production_plan = []
+            self.checked_ids.clear()
+            self.mrp_result = None
+            self.loaded_plan_id   = None   # ← 새로 시작 시 연결 해제
+            self.loaded_plan_name = None
             self._refresh_plan_tree()
-            # 결과 영역도 초기화
             for w in self.result_frame.winfo_children():
                 w.destroy()
+            self.result_frame.pack_forget()
+            self.result_frame.pack(fill=tk.X, padx=5)
             self.export_btn.configure(state="disabled")
+            self.app.root.update_idletasks()
+
+    # ═══════════════════════════════════════════
+    # 생산 계획 체크박스
+    # ═══════════════════════════════════════════
+    def _on_plan_click(self, event):
+        col = self.plan_tree.identify_column(event.x)
+        row = self.plan_tree.identify_row(event.y)
+        if not row:
+            return
+        vals = self.plan_tree.item(row)["values"]
+        pid  = str(vals[2])
+        if col == "#1":
+            if pid in self.checked_ids:
+                self.checked_ids.discard(pid)
+            else:
+                self.checked_ids.add(pid)
+            self._refresh_plan_tree()
+
+    def _select_all_plan(self):
+        self.checked_ids = {p["product_id"] for p in self.production_plan}
+        self._refresh_plan_tree()
+
+    def _deselect_all_plan(self):
+        self.checked_ids.clear()
+        self._refresh_plan_tree()
+
+    def _delete_checked_plans(self):
+        if not self.checked_ids:
+            messagebox.showinfo("알림", "삭제할 항목을 먼저 체크해 주세요.")
+            return
+        names = [p["product_name"] for p in self.production_plan
+                 if p["product_id"] in self.checked_ids]
+        body  = "\n".join("  - " + n for n in names)
+        msg   = str(len(names)) + "개 항목을 삭제하시겠습니까?\n\n" + body
+        if not messagebox.askyesno("선택 삭제", msg):
+            return
+        self.production_plan = [
+            p for p in self.production_plan
+            if p["product_id"] not in self.checked_ids
+        ]
+        self.checked_ids.clear()
+        self._refresh_plan_tree()
+
+    def _edit_qty_dialog(self):
+        selected = self.plan_tree.selection()
+        if len(self.checked_ids) == 1:
+            pid = next(iter(self.checked_ids))
+        elif selected:
+            vals = self.plan_tree.item(selected[0])["values"]
+            pid  = str(vals[2])
+        else:
+            messagebox.showinfo("알림", "수정할 항목을 체크하거나 클릭으로 선택해 주세요.")
+            return
+        if len(self.checked_ids) > 1:
+            messagebox.showinfo("알림", "수량 수정은 한 번에 1개 항목만 가능합니다.")
+            return
+        plan = next((p for p in self.production_plan if p["product_id"] == pid), None)
+        if not plan:
+            return
+
+        dlg = tk.Toplevel(self.app.root)
+        dlg.title("목표 수량 수정")
+        self.app.center_dialog(dlg, 340, 200)
+        dlg.resizable(False, False)
+        dlg.transient(self.app.root)
+        dlg.grab_set()
+
+        tk.Label(dlg,
+                 text=plan["product_name"] + " (" + pid + ")",
+                 font=(FONT_FAMILY, FONT_SIZES["body"], "bold"),
+                 padx=24, pady=16).pack(anchor="w")
+        row_f = tk.Frame(dlg)
+        row_f.pack(fill=tk.X, padx=24, pady=8)
+        tk.Label(row_f, text="목표 수량:",
+                 font=(FONT_FAMILY, FONT_SIZES["small"], "bold")).pack(side=tk.LEFT)
+        ent = tk.Entry(row_f, font=(FONT_FAMILY, FONT_SIZES["body"]), width=12)
+        ent.pack(side=tk.LEFT, padx=10)
+        ent.insert(0, str(plan["target_qty"]))
+        ent.select_range(0, tk.END)
+        ent.focus_set()
+        tk.Label(row_f, text="개",
+                 font=(FONT_FAMILY, FONT_SIZES["small"])).pack(side=tk.LEFT)
+
+        def save():
+            try:
+                qty = int(ent.get().strip())
+                if qty <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("입력 오류", "1 이상의 정수를 입력해 주세요.", parent=dlg)
+                return
+            plan["target_qty"] = qty
+            dlg.destroy()
+            self.checked_ids.clear()
+            self._refresh_plan_tree()
+
+        btn_f = tk.Frame(dlg)
+        btn_f.pack(pady=12)
+        qty_save_btn = tk.Button(btn_f, text="저장",
+                                 font=(FONT_FAMILY, FONT_SIZES["body"], "bold"),
+                                 bg=COLORS["primary"], fg="white",
+                                 padx=20, pady=6, cursor="hand2",
+                                 command=save)
+        qty_save_btn.pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_f, text="취소",
+                  padx=20, pady=6, cursor="hand2",
+                  command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+        ent.bind("<Return>", lambda e: flash_btn(qty_save_btn, save))
+
+    # ═══════════════════════════════════════════
+    # MRP 계획 저장
+    # ═══════════════════════════════════════════
+    def _save_plan_dialog(self):
+        if not self.mrp_result:
+            messagebox.showwarning("알림", "먼저 소요량 계산을 실행해 주세요.")
+            return
+
+        # ── 불러온 계획이 있으면 덮어쓰기 여부 먼저 물어봄 ──
+        if self.loaded_plan_id:
+            ans = messagebox.askyesnocancel(
+                "저장 방식 선택",
+                f"'{self.loaded_plan_name}' 계획을 수정했습니다.\n\n"
+                "예 → 기존 계획에 덮어쓰기\n"
+                "아니오 → 새 계획으로 저장\n"
+                "취소 → 돌아가기"
+            )
+            if ans is None:      # 취소
+                return
+            if ans:              # 예 → 덮어쓰기
+                self._do_update(self.loaded_plan_id, self.loaded_plan_name)
+                return
+            # ans == False → 새 계획으로 저장 (아래 다이얼로그로 진행)
+
+        from datetime import datetime as _dt
+        default_name = (self.loaded_plan_name or "") or _dt.now().strftime("%Y-%m-%d") + " MRP 계획"
+
+        dlg = tk.Toplevel(self.app.root)
+        dlg.title("MRP 계획 저장")
+        self.app.center_dialog(dlg, 380, 170)
+        dlg.resizable(False, False)
+        dlg.transient(self.app.root)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="계획명을 입력하세요:",
+                 font=(FONT_FAMILY, FONT_SIZES["body"], "bold"),
+                 padx=24).pack(anchor="w", pady=(20, 4))
+        ent = tk.Entry(dlg, font=(FONT_FAMILY, FONT_SIZES["body"]), width=34)
+        ent.pack(padx=24, pady=(0, 4))
+        ent.insert(0, default_name)
+        ent.select_range(0, tk.END)
+        ent.focus_set()
+
+        def do_save():
+            plan_name = ent.get().strip()
+            if not plan_name:
+                messagebox.showwarning("입력 오류", "계획명을 입력해 주세요.", parent=dlg)
+                return
+            dlg.destroy()
+            self._do_save(plan_name)
+
+        btn_f = tk.Frame(dlg)
+        btn_f.pack(pady=10)
+        plan_save_btn = tk.Button(btn_f, text="저장",
+                                  font=(FONT_FAMILY, FONT_SIZES["body"], "bold"),
+                                  bg=COLORS["primary"], fg="white", padx=18, pady=5,
+                                  cursor="hand2", command=do_save)
+        plan_save_btn.pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_f, text="취소",
+                  padx=18, pady=5, cursor="hand2",
+                  command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+        ent.bind("<Return>", lambda e: flash_btn(plan_save_btn, do_save))
+
+    def _do_save(self, plan_name):
+        def worker():
+            try:
+                plan_id = self.app.db.save_mrp_plan(
+                    plan_name, self.production_plan,
+                    self.mrp_result, self.safety_stock_var.get())
+                # 새로 저장된 계획을 현재 loaded 계획으로 설정 (이후 다시 저장 시 덮어쓰기 가능)
+                self.loaded_plan_id   = plan_id
+                self.loaded_plan_name = plan_name
+                ok_msg = "'" + plan_name + "' 저장 완료 (ID: " + plan_id + ")"
+                self.app.root.after(0, lambda: (
+                    messagebox.showinfo("저장 완료", ok_msg),
+                    self._load_history()
+                ))
+            except Exception as e:
+                err = str(e)
+                self.app.root.after(0, lambda: messagebox.showerror("저장 오류", err))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _do_update(self, plan_id, plan_name):
+        """기존 MRP 계획 덮어쓰기"""
+        def worker():
+            try:
+                ok = self.app.db.update_mrp_plan(
+                    plan_id, plan_name, self.production_plan,
+                    self.mrp_result, self.safety_stock_var.get())
+                if ok:
+                    ok_msg = "'" + plan_name + "' 계획이 업데이트되었습니다."
+                    self.app.root.after(0, lambda: (
+                        messagebox.showinfo("저장 완료", ok_msg),
+                        self._load_history()
+                    ))
+                else:
+                    # plan_id 가 시트에 없는 경우 → 새 계획으로 저장 제안
+                    self.app.root.after(0, lambda: self._offer_save_as_new(plan_name))
+            except Exception as e:
+                err = str(e)
+                self.app.root.after(0, lambda: messagebox.showerror(
+                    "저장 오류", f"계획 업데이트 중 오류가 발생했습니다:\n{err}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _offer_save_as_new(self, plan_name):
+        """덮어쓰기 실패 시 새 계획으로 저장할지 물어봄"""
+        ans = messagebox.askyesno(
+            "저장 오류",
+            f"'{plan_name}' 계획을 시트에서 찾을 수 없습니다.\n"
+            "(삭제됐거나 ID가 변경됐을 수 있습니다.)\n\n"
+            "새 계획으로 저장하시겠습니까?"
+        )
+        if ans:
+            self._do_save(plan_name)
+
+    # ═══════════════════════════════════════════
+    # 저장된 MRP 계획 이력 목록 카드
+    # ═══════════════════════════════════════════
+    def _build_history_card(self):
+        sep = tk.Frame(self.scroll_frame, bg=COLORS["border"], height=2)
+        sep.pack(fill=tk.X, padx=5, pady=(16, 0))
+
+        card = tk.Frame(self.scroll_frame, bg=COLORS["card_bg"],
+                        highlightbackground=COLORS["border"], highlightthickness=1)
+        card.pack(fill=tk.X, padx=5, pady=(0, 12))
+
+        hdr = tk.Frame(card, bg=COLORS["card_bg"])
+        hdr.pack(fill=tk.X, padx=15, pady=(12, 6))
+
+        left_h = tk.Frame(hdr, bg=COLORS["card_bg"])
+        left_h.pack(side=tk.LEFT)
+        tk.Label(left_h, text="저장된 MRP 계획 목록",
+                 bg=COLORS["card_bg"], fg=COLORS["text"],
+                 font=(FONT_FAMILY, FONT_SIZES["heading"], "bold")).pack(side=tk.LEFT)
+        self._hist_count_lbl = tk.Label(left_h, text="(0건)",
+                                         bg=COLORS["card_bg"], fg=COLORS["text_secondary"],
+                                         font=(FONT_FAMILY, FONT_SIZES["small"]))
+        self._hist_count_lbl.pack(side=tk.LEFT, padx=8)
+
+        right_h = tk.Frame(hdr, bg=COLORS["card_bg"])
+        right_h.pack(side=tk.RIGHT)
+        tk.Button(right_h, text="불러오기",
+                  font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg=COLORS["primary"], fg="white", padx=8, pady=2, cursor="hand2",
+                  command=self._load_checked_history).pack(side=tk.LEFT, padx=2)
+        tk.Button(right_h, text="이름 수정",
+                  font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg="#0ea5e9", fg="white", padx=8, pady=2, cursor="hand2",
+                  command=self._rename_history).pack(side=tk.LEFT, padx=2)
+        tk.Button(right_h, text="선택 삭제",
+                  font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg=COLORS["danger"], fg="white", padx=8, pady=2, cursor="hand2",
+                  command=self._delete_checked_history).pack(side=tk.LEFT, padx=2)
+        tk.Button(right_h, text="새로고침",
+                  font=(FONT_FAMILY, FONT_SIZES["small"]),
+                  bg="#e2e8f0", fg=COLORS["text"], padx=8, pady=2, cursor="hand2",
+                  command=self._load_history).pack(side=tk.LEFT, padx=(2, 0))
+
+        tf = tk.Frame(card, bg=COLORS["card_bg"])
+        tf.pack(fill=tk.X, padx=15, pady=(0, 12))
+
+        hist_cols = ("hchk", "hno", "hid", "hdate", "hname", "hcnt", "hsafe")
+        self.history_tree = ttk.Treeview(tf, columns=hist_cols,
+                                          show="headings", height=6)
+        for cid, heading, width, anchor in [
+            ("hchk",  "V",        36,  "center"),
+            ("hno",   "No",        36,  "center"),
+            ("hid",   "저장ID",    70,  "center"),
+            ("hdate", "저장일시", 130,  "center"),
+            ("hname", "계획명",   220,  "w"),
+            ("hcnt",  "제품수",    60,  "center"),
+            ("hsafe", "안전재고",  70,  "center"),
+        ]:
+            self.history_tree.heading(cid, text=heading)
+            self.history_tree.column(cid, width=width, anchor=anchor,
+                                      minwidth=width if cid in ("hchk", "hno") else 30,
+                                      stretch=(cid not in ("hchk", "hno")))
+
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=vsb.set)
+        self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.history_tree.bind("<ButtonRelease-1>", self._on_hist_click)
+        self.history_tree.bind("<Double-1>",        lambda e: self._load_checked_history())
+
+        self._hist_menu = tk.Menu(self.history_tree, tearoff=0)
+        self._hist_menu.add_command(label="불러오기",  command=self._load_checked_history)
+        self._hist_menu.add_command(label="이름 수정", command=self._rename_history)
+        self._hist_menu.add_separator()
+        self._hist_menu.add_command(label="삭제",      command=self._delete_checked_history)
+        self.history_tree.bind("<Button-3>", self._hist_right_click)
+
+    def _load_history(self):
+        def load():
+            try:
+                rows = self.app.db.get_all_mrp_history()
+                self.app.root.after(0, lambda: self._render_history(rows))
+            except Exception as e:
+                err = str(e)
+                self.app.root.after(0, lambda: messagebox.showerror("오류", err))
+        threading.Thread(target=load, daemon=True).start()
+
+    def _render_history(self, rows):
+        if not self.history_tree:
+            return
+        self.history_tree.delete(*self.history_tree.get_children())
+        for i, row in enumerate(rows, 1):
+            pid  = str(row.get("저장ID", ""))
+            chk  = "[v]" if pid in self.hist_checked else "[ ]"
+            safe = "Y" if str(row.get("안전재고반영", "FALSE")).upper() == "TRUE" else "N"
+            self.history_tree.insert("", tk.END, values=(
+                chk, i, pid,
+                row.get("저장일시", ""),
+                row.get("계획명", ""),
+                str(row.get("제품수", "")) + "개",
+                safe,
+            ))
+        self._hist_count_lbl.configure(text="(" + str(len(rows)) + "건)")
+
+    def _on_hist_click(self, event):
+        col = self.history_tree.identify_column(event.x)
+        row = self.history_tree.identify_row(event.y)
+        if not row:
+            return
+        vals = self.history_tree.item(row)["values"]
+        pid  = str(vals[2])
+        if col == "#1":
+            if pid in self.hist_checked:
+                self.hist_checked.discard(pid)
+            else:
+                self.hist_checked.add(pid)
+        else:
+            self.hist_checked = {pid}
+        self._refresh_history_checks()
+
+    def _refresh_history_checks(self):
+        for item in self.history_tree.get_children():
+            vals      = list(self.history_tree.item(item)["values"])
+            vals[0]   = "[v]" if str(vals[2]) in self.hist_checked else "[ ]"
+            self.history_tree.item(item, values=vals)
+
+    def _hist_right_click(self, event):
+        row = self.history_tree.identify_row(event.y)
+        if row:
+            vals = self.history_tree.item(row)["values"]
+            self.hist_checked = {str(vals[2])}
+            self._refresh_history_checks()
+            self._hist_menu.post(event.x_root, event.y_root)
+
+    def _load_checked_history(self):
+        if not self.hist_checked:
+            messagebox.showinfo("알림", "불러올 계획을 선택해 주세요.")
+            return
+        if len(self.hist_checked) > 1:
+            messagebox.showinfo("알림", "불러오기는 한 번에 1개만 가능합니다.")
+            return
+        plan_id = next(iter(self.hist_checked))
+        def load():
+            try:
+                detail = self.app.db.get_mrp_plan_detail(plan_id)
+                self.app.root.after(0, lambda: self._apply_loaded_plan(detail))
+            except Exception as e:
+                err = str(e)
+                self.app.root.after(0, lambda: messagebox.showerror("오류", err))
+        threading.Thread(target=load, daemon=True).start()
+
+    def _apply_loaded_plan(self, detail):
+        if not detail:
+            messagebox.showerror("오류", "계획 데이터를 불러올 수 없습니다.")
+            return
+        self.production_plan = detail.get("production_plan", [])
+        self.checked_ids.clear()
+        self.mrp_result = None
+        self.loaded_plan_id   = detail.get("plan_id")   # ← 불러온 계획 ID 기억
+        self.loaded_plan_name = detail.get("name", "")  # ← 불러온 계획명 기억
+        self.safety_stock_var.set(detail.get("include_safety", False))
+        # 결과 영역 초기화
+        for w in self.result_frame.winfo_children():
+            w.destroy()
+        self.result_frame.pack_forget()
+        self.result_frame.pack(fill=tk.X, padx=5)
+        self.export_btn.configure(state="disabled")
+        self.app.root.update_idletasks()
+        self._refresh_plan_tree()
+        name = detail.get("name", "")
+        messagebox.showinfo("불러오기 완료",
+                            "'" + name + "' 계획이 복원되었습니다.\n"
+                            "수정 후 [소요량 계산] 버튼을 눌러 계산하세요.")
+
+    def _rename_history(self):
+        if not self.hist_checked:
+            messagebox.showinfo("알림", "수정할 계획을 선택해 주세요.")
+            return
+        if len(self.hist_checked) > 1:
+            messagebox.showinfo("알림", "이름 수정은 한 번에 1개만 가능합니다.")
+            return
+        plan_id  = next(iter(self.hist_checked))
+        cur_name = ""
+        for item in self.history_tree.get_children():
+            vals = self.history_tree.item(item)["values"]
+            if str(vals[2]) == plan_id:
+                cur_name = str(vals[4])
+                break
+
+        dlg = tk.Toplevel(self.app.root)
+        dlg.title("계획명 수정")
+        self.app.center_dialog(dlg, 360, 160)
+        dlg.resizable(False, False)
+        dlg.transient(self.app.root)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="새 계획명:",
+                 font=(FONT_FAMILY, FONT_SIZES["body"], "bold"),
+                 padx=24).pack(anchor="w", pady=(18, 4))
+        ent = tk.Entry(dlg, font=(FONT_FAMILY, FONT_SIZES["body"]), width=34)
+        ent.pack(padx=24)
+        ent.insert(0, cur_name)
+        ent.select_range(0, tk.END)
+        ent.focus_set()
+
+        def do_rename():
+            new_name = ent.get().strip()
+            if not new_name:
+                messagebox.showwarning("입력 오류", "계획명을 입력해 주세요.", parent=dlg)
+                return
+            dlg.destroy()
+            def worker():
+                try:
+                    self.app.db.update_mrp_plan_name(plan_id, new_name)
+                    self.app.root.after(0, self._load_history)
+                except Exception as e:
+                    err = str(e)
+                    self.app.root.after(0, lambda: messagebox.showerror("오류", err))
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn_f = tk.Frame(dlg)
+        btn_f.pack(pady=10)
+        rename_btn = tk.Button(btn_f, text="저장",
+                               font=(FONT_FAMILY, FONT_SIZES["body"], "bold"),
+                               bg=COLORS["primary"], fg="white", padx=18, pady=5,
+                               cursor="hand2", command=do_rename)
+        rename_btn.pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_f, text="취소",
+                  padx=18, pady=5, cursor="hand2",
+                  command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+        ent.bind("<Return>", lambda e: flash_btn(rename_btn, do_rename))
+
+    def _delete_checked_history(self):
+        if not self.hist_checked:
+            messagebox.showinfo("알림", "삭제할 계획을 선택해 주세요.")
+            return
+        n   = len(self.hist_checked)
+        msg = str(n) + "건의 MRP 계획을 삭제하시겠습니까?"
+        if not messagebox.askyesno("삭제 확인", msg):
+            return
+        ids = list(self.hist_checked)
+        def worker():
+            try:
+                cnt = self.app.db.delete_mrp_plans(ids)
+                self.hist_checked.clear()
+                done = str(cnt) + "건 삭제되었습니다."
+                self.app.root.after(0, lambda: (
+                    messagebox.showinfo("삭제 완료", done),
+                    self._load_history()
+                ))
+            except Exception as e:
+                err = str(e)
+                self.app.root.after(0, lambda: messagebox.showerror("오류", err))
+        threading.Thread(target=worker, daemon=True).start()
 
     # ═══════════════════════════════════════════
     # MRP 계산
@@ -505,12 +1022,23 @@ class MrpPage:
         self.mrp_result = result
         self.export_btn.configure(state="normal")
 
-        # 결과 영역 초기화
+        # 결과 영역 초기화 후 expand=True로 재팩
         for w in self.result_frame.winfo_children():
             w.destroy()
+        self.result_frame.pack_forget()
+        self.result_frame.pack(fill=tk.BOTH, expand=True, padx=5)
 
         # ── 생산 계획 요약 업데이트 ──
         self._refresh_plan_tree_with_result(result["plan_summary"])
+
+        # ── 저장 버튼 ──
+        save_bar = tk.Frame(self.result_frame, bg=COLORS["bg"])
+        save_bar.pack(fill=tk.X, pady=(4, 0))
+        tk.Button(save_bar, text="계획 저장",
+                  font=(FONT_FAMILY, FONT_SIZES["body"], "bold"),
+                  bg="#059669", fg="white", padx=16, pady=5,
+                  cursor="hand2",
+                  command=self._save_plan_dialog).pack(side=tk.RIGHT, padx=2)
 
         # ── 요약 통계 카드 ──
         stats_frame = tk.Frame(self.result_frame, bg=COLORS["bg"])
@@ -550,9 +1078,11 @@ class MrpPage:
 
         for i, item in enumerate(plan_summary, 1):
             need = item["need_to_produce"]
+            pid  = item["product_id"]
+            chk  = "[v]" if pid in self.checked_ids else "[ ]"
             tag  = "need" if need > 0 else "ok"
             self.plan_tree.insert("", tk.END, values=(
-                i, item["product_id"], item["product_name"],
+                chk, i, pid, item["product_name"],
                 f"{item['current_stock']}개", f"{item['target_qty']}개",
                 f"{need}개" if need > 0 else "충분",
                 f"{item['max_producible']}개",
@@ -799,35 +1329,48 @@ class MrpPage:
         for i, w in enumerate(widths2, 1):
             ws2.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
-        # ── Sheet 3: 발주 필요 부품만 (업체별 그룹핑) ──
-        ws3 = wb.create_sheet("발주필요_업체별")
+        # ── Sheet 3: 전체 부품 (업체별 그룹핑, 재고 충분 포함) ──
+        ws3 = wb.create_sheet("발주현황_업체별")
 
-        ws3.merge_cells("A1:H1")
-        ws3["A1"] = f"발주 필요 부품 (업체별) - {now}"
+        ws3.merge_cells("A1:I1")
+        ws3["A1"] = f"부품 발주 현황 (업체별 전체) - {now}"
         ws3["A1"].font = title_font
         ws3.row_dimensions[1].height = 30
 
-        # 업체별 그룹핑
-        order_parts = [p for p in self.mrp_result["parts_requirement"] if p["order_needed"]]
+        # 전체 부품을 업체별로 그룹핑 (발주 필요 + 재고 충분 모두 포함)
+        all_req_parts = self.mrp_result["parts_requirement"]
         suppliers = {}
-        for part in order_parts:
+        for part in all_req_parts:
             supplier = part["supplier"] if part["supplier"] else "(업체 미지정)"
             if supplier not in suppliers:
                 suppliers[supplier] = []
             suppliers[supplier].append(part)
 
+        def _qty_or_blank(val):
+            """0이면 빈칸, 아니면 그대로 반환"""
+            return "" if val == 0 else val
+
+        ok_fill   = PatternFill(start_color="F0FDF4", end_color="F0FDF4", fill_type="solid")  # 연초록 - 충분
+        need_fill = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")  # 연빨강 - 발주필요
+        ok_font   = Font(name="맑은 고딕", size=10, color="16A34A")   # 초록 글씨
+        ok_bold   = Font(name="맑은 고딕", size=10, bold=True, color="16A34A")
+
         current_row = 3
         for supplier, parts in sorted(suppliers.items()):
-            # 업체명 헤더
-            ws3.merge_cells(f"A{current_row}:H{current_row}")
-            cell = ws3.cell(row=current_row, column=1, value=f"▶ {supplier} ({len(parts)}종)")
+            order_cnt = sum(1 for p in parts if p["order_needed"])
+            ok_cnt    = len(parts) - order_cnt
+
+            # 업체명 헤더 (발주 필요/충분 건수 표시)
+            ws3.merge_cells(f"A{current_row}:I{current_row}")
+            cell = ws3.cell(row=current_row, column=1,
+                            value=f"▶ {supplier}  (전체 {len(parts)}종 | 발주필요 {order_cnt}종 | 충분 {ok_cnt}종)")
             cell.font = Font(name="맑은 고딕", bold=True, size=11, color="1E293B")
             cell.fill = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
             current_row += 1
 
             # 컬럼 헤더
             sub_headers = ["No", "품번", "부품명", "단위", "총소요량",
-                           "현재재고", "부족수량", "비고"]
+                           "현재재고", "부족수량/상태", "사용제품코드", "비고"]
             for col, h in enumerate(sub_headers, 1):
                 cell = ws3.cell(row=current_row, column=col, value=h)
                 cell.font = header_font
@@ -836,24 +1379,103 @@ class MrpPage:
                 cell.border = thin_border
             current_row += 1
 
-            # 데이터
-            for j, part in enumerate(parts, 1):
-                values = [j, part["part_id"], part["part_name"], part["unit"],
-                          part["total_required"], part["current_stock"],
-                          int(part["shortage"]), ""]
+            # 발주필요 먼저, 충분 나중 순으로 정렬
+            sorted_parts = sorted(parts, key=lambda p: (not p["order_needed"], p["part_id"]))
+
+            for j, part in enumerate(sorted_parts, 1):
+                product_codes_str = ", ".join(part.get("product_codes", []))
+                is_ok = not part["order_needed"]
+
+                if is_ok:
+                    shortage_val = "충분"
+                else:
+                    shortage_val = _qty_or_blank(int(part["shortage"]))
+
+                values = [j,
+                          part["part_id"],
+                          part["part_name"],
+                          part["unit"],
+                          _qty_or_blank(part["total_required"]),
+                          _qty_or_blank(part["current_stock"]),
+                          shortage_val,
+                          product_codes_str,
+                          ""]
+
+                row_fill = ok_fill if is_ok else need_fill
+
                 for col, val in enumerate(values, 1):
                     cell = ws3.cell(row=current_row, column=col, value=val)
-                    cell.font = normal_font
+                    cell.fill = row_fill
                     cell.border = thin_border
                     cell.alignment = Alignment(horizontal="center")
+
                     if col == 7:
-                        cell.font = danger_font
+                        if is_ok:
+                            cell.font = ok_bold
+                        elif val != "":
+                            cell.font = danger_font
+                        else:
+                            cell.font = normal_font
+                    elif col == 8:
+                        cell.font = normal_font
+                        cell.alignment = Alignment(horizontal="left")
+                    else:
+                        cell.font = ok_font if is_ok else normal_font
+
                 current_row += 1
 
             current_row += 1  # 업체 간 빈 줄
 
-        widths3 = [6, 15, 30, 8, 12, 12, 12, 20]
+        widths3 = [6, 15, 30, 8, 12, 12, 14, 30, 20]
         for i, w in enumerate(widths3, 1):
             ws3.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        # ── Sheet 4: Raw 데이터 (피벗테이블용) ──
+        ws4 = wb.create_sheet("Raw데이터")
+
+        raw_header_fill = PatternFill(start_color="1D4ED8", end_color="1D4ED8", fill_type="solid")
+        raw_headers = ["사용제품코드", "품번", "업체명", "부품명", "재질/규격", "단가", "소요량"]
+        for col, h in enumerate(raw_headers, 1):
+            cell = ws4.cell(row=1, column=col, value=h)
+            cell.font = header_font
+            cell.fill = raw_header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+        ws4.row_dimensions[1].height = 26
+
+        price_font = Font(name="맑은 고딕", size=10)
+        for row_idx, part in enumerate(self.mrp_result["parts_requirement"], 2):
+            product_codes_str = ", ".join(part.get("product_codes", []))
+            unit_price = part.get("unit_price", 0)
+            values = [
+                product_codes_str,
+                part["part_id"],
+                part["supplier"],
+                part["part_name"],
+                part.get("spec", ""),
+                unit_price if unit_price else "",
+                part["total_required"],
+            ]
+            for col, val in enumerate(values, 1):
+                cell = ws4.cell(row=row_idx, column=col, value=val)
+                cell.font = price_font
+                cell.border = thin_border
+                # 단가: 오른쪽 정렬 + 숫자 서식
+                if col == 6 and val != "":
+                    cell.alignment = Alignment(horizontal="right")
+                    cell.number_format = "#,##0"
+                # 소요량: 가운데 정렬
+                elif col == 7:
+                    cell.alignment = Alignment(horizontal="center")
+                # 나머지: 왼쪽 정렬
+                else:
+                    cell.alignment = Alignment(horizontal="left")
+
+        widths4 = [30, 15, 15, 30, 20, 14, 10]
+        for i, w in enumerate(widths4, 1):
+            ws4.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        # 자동 필터 적용 (피벗 활용 편의)
+        ws4.auto_filter.ref = f"A1:G{len(self.mrp_result['parts_requirement']) + 1}"
 
         wb.save(file_path)

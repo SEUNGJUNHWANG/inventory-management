@@ -11,6 +11,16 @@ from datetime import datetime, timedelta
 from core.constants import COLORS, FONT_FAMILY, FONT_SIZES, HISTORY_COLUMNS
 
 
+def _bind_tree_scroll(tree):
+    """Treeview에 마우스 휠 스크롤 바인딩 (hover 기반)"""
+    def _on_mw(e):
+        try:
+            tree.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        except Exception:
+            pass
+    tree.bind("<Enter>", lambda e: tree.bind_all("<MouseWheel>", _on_mw))
+    tree.bind("<Leave>", lambda e: tree.unbind_all("<MouseWheel>"))
+
 class HistoryPage:
     def __init__(self, app):
         self.app = app
@@ -18,6 +28,8 @@ class HistoryPage:
         self.history_menu = None
         self.hist_start = None
         self.hist_end = None
+        self._loaded_rows = []   # 현재 로드된 전체 행 캐시 (검색 필터링용)
+        self.search_var = None   # 검색어 StringVar
 
     def render(self):
         scroll_frame = self.app._create_scrollable_frame()
@@ -45,6 +57,26 @@ class HistoryPage:
                   command=self._load_data).pack(side=tk.LEFT, padx=5)
         tk.Button(filter_frame, text="전체 조회", font=(FONT_FAMILY, 9),
                   command=lambda: self._load_data(all_data=True)).pack(side=tk.LEFT)
+
+        # ── 검색 입력창 ──
+        tk.Frame(filter_frame, bg=COLORS["bg"], width=20).pack(side=tk.LEFT)  # 구분 여백
+        tk.Label(filter_frame, text="🔍 검색:", bg=COLORS["bg"],
+                 font=(FONT_FAMILY, FONT_SIZES["small"])).pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        search_entry = tk.Entry(filter_frame, textvariable=self.search_var,
+                                font=(FONT_FAMILY, FONT_SIZES["small"]), width=20)
+        search_entry.pack(side=tk.LEFT, padx=(3, 2))
+        search_entry.bind("<KeyRelease>", lambda e: self._apply_search())
+        search_entry.bind("<Control-a>", lambda e: (search_entry.select_range(0, tk.END), "break")[1])
+
+        tk.Button(filter_frame, text="✕", font=(FONT_FAMILY, 8),
+                  padx=4, pady=1, relief="flat",
+                  command=lambda: (self.search_var.set(""), self._apply_search())).pack(side=tk.LEFT)
+
+        self._count_label = tk.Label(filter_frame, text="", bg=COLORS["bg"],
+                                     fg=COLORS["text_secondary"],
+                                     font=(FONT_FAMILY, FONT_SIZES["small"]))
+        self._count_label.pack(side=tk.LEFT, padx=(8, 0))
 
         card = tk.Frame(scroll_frame, bg=COLORS["card_bg"],
                         highlightbackground=COLORS["border"], highlightthickness=1)
@@ -103,14 +135,13 @@ class HistoryPage:
                 self.app.root.after(0, lambda: messagebox.showerror("오류", err_msg))
 
         def render(history, is_all):
-            self.history_tree.delete(*self.history_tree.get_children())
             all_hist = self.app.db.get_all_history() if not is_all else history[::-1]
+            self._loaded_rows = []
             for idx, h in enumerate(history):
                 row_no = len(all_hist) - idx + 1 if not is_all else len(history) - idx + 1
                 h_type = h.get("유형", "")
                 h_direction = h.get("구분", "")
 
-                # 행 색상 태그 결정
                 tag = "normal"
                 if h_type == "생산입고":
                     tag = "생산입고"
@@ -119,15 +150,46 @@ class HistoryPage:
                 elif h_direction == "취소":
                     tag = "취소"
 
-                self.history_tree.insert("", "end", values=(
-                    row_no,
-                    h.get("일시", ""), h.get("구분", ""), h_type,
-                    h.get("품번/제품코드", ""), h.get("품명", ""),
-                    h.get("수량", ""), h.get("잔여재고", ""),
-                    h.get("관련제품", ""), h.get("비고", ""),
-                ), tags=(tag,))
+                self._loaded_rows.append({
+                    "values": (
+                        row_no,
+                        h.get("일시", ""), h.get("구분", ""), h_type,
+                        h.get("품번/제품코드", ""), h.get("품명", ""),
+                        h.get("수량", ""), h.get("잔여재고", ""),
+                        h.get("관련제품", ""), h.get("비고", ""),
+                    ),
+                    "tag": tag,
+                })
+            self._apply_search()
 
         threading.Thread(target=load, daemon=True).start()
+
+    def _apply_search(self, *_):
+        """현재 로드된 행을 검색어로 클라이언트 필터링 후 트리 재렌더링."""
+        keyword = (self.search_var.get().strip().lower()
+                   if self.search_var else "")
+        self.history_tree.delete(*self.history_tree.get_children())
+
+        matched = 0
+        for row in self._loaded_rows:
+            if not keyword or any(keyword in str(v).lower() for v in row["values"]):
+                self.history_tree.insert("", "end",
+                                         values=row["values"],
+                                         tags=(row["tag"],))
+                matched += 1
+
+        total = len(self._loaded_rows)
+        if hasattr(self, "_count_label") and self._count_label:
+            if keyword:
+                self._count_label.config(
+                    text=f"{matched:,} / {total:,}건",
+                    fg=COLORS["primary"] if matched else COLORS["danger"],
+                )
+            else:
+                self._count_label.config(
+                    text=f"총 {total:,}건",
+                    fg=COLORS["text_secondary"],
+                )
 
     def _right_click(self, event):
         item = self.history_tree.identify_row(event.y)
@@ -216,11 +278,7 @@ class HistoryPage:
 
             # 크기 및 위치 설정
             dw, dh = 600, 450
-            sw = result_dialog.winfo_screenwidth()
-            sh = result_dialog.winfo_screenheight()
-            x = (sw - dw) // 2
-            y = (sh - dh) // 2
-            result_dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+            self.app.center_dialog(result_dialog, dw, dh)
             result_dialog.resizable(True, True)
 
             # 성공 아이콘 및 제목
