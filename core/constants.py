@@ -94,7 +94,7 @@ MENU_ITEMS = [
     ("mrp", "📋 자재소요계획"),
     ("history", "📜 입출고 이력"),
     ("report", "📊 리포트"),
-    ("price_history", "💰 단가변경이력"),
+    ("analytics",    "📈 분석 대시보드"),
     ("settings", "⚙️ 설정"),
     ("users",    "👤 사용자 관리"),
 ]
@@ -116,7 +116,7 @@ MENU_LABELS = {
     "mrp":       "📋 자재소요계획",
     "history":   "📜 입출고 이력",
     "report":        "📊 리포트",
-    "price_history": "💰 단가변경이력",
+    "analytics":     "📈 분석 대시보드",
     "settings":      "⚙️ 설정",
     "users":     "👤 사용자 관리",
 }
@@ -125,7 +125,7 @@ MENU_LABELS = {
 ALL_MENU_IDS = [
     "dashboard", "parts", "products", "bom",
     "receive", "issue", "produce", "ship", "customers", "mrp",
-    "history", "report", "price_history", "settings", "users",
+    "history", "report", "analytics", "settings", "users",
 ]
 
 # 기본 관리자 계정 정보

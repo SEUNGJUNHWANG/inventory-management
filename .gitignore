@@ -7,4 +7,18 @@ config.json
 primeval-span-*.json
 *.log
 _update_new.exe
-_do_upda
+_do_update.bat
+
+# 백업/임시 파일
+*.bak
+*.bak_*
+*.bak_price
+*_backup.py
+*_raw.txt
+
+# Claude Cowork 세션 데이터 (소스코드 아님)
+.claude/
+
+# 구버전 실행 스크립트 (정리됨)
+run_app.bat
+start_app.vbs

@@ -41,7 +41,7 @@ from ui.pages.login import LoginPage
 from ui.pages.users import UsersPage
 from ui.pages.ship import ShipPage
 from ui.pages.customers import CustomersPage
-from ui.pages.price_history import PriceHistoryPage
+from ui.pages.analytics    import AnalyticsDashboard
 
 
 class InventoryApp:
@@ -79,7 +79,7 @@ class InventoryApp:
             "users":     UsersPage(self),
             "ship":          ShipPage(self),
             "customers":     CustomersPage(self),
-            "price_history": PriceHistoryPage(self),
+            "analytics":     AnalyticsDashboard(self),
         }
         self._login_page = LoginPage(self)
 

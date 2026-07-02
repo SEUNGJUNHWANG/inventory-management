@@ -49,6 +49,7 @@ SHEET_CUSTOMERS = "거래처"
 SHEET_SALES     = "판매이력"
 SHEET_MRP       = "MRP이력"
 SHEET_PRICE_LOG = "단가변경이력"
+SHEET_BOM_LOG   = "BOM변경이력"
 
 # 캐시 유효 시간 (초)
 CACHE_TTL         = 120   # 부품·제품·BOM: 2분
@@ -314,6 +315,17 @@ class GoogleSheetsDB:
             ws = self.spreadsheet.add_worksheet(title=SHEET_PRICE_LOG, rows=5000, cols=10)
             self._safe_update(ws, "A1:I1", [PRICE_LOG_HEADERS])
 
+        # BOM변경이력 시트
+        BOM_LOG_HEADERS = [
+            "변경일시", "변경유형", "제품코드", "제품명",
+            "부품품번", "부품명", "이전소요량", "변경소요량", "변경자"
+        ]
+        try:
+            self.spreadsheet.worksheet(SHEET_BOM_LOG)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(title=SHEET_BOM_LOG, rows=5000, cols=10)
+            self._safe_update(ws, "A1:I1", [BOM_LOG_HEADERS])
+
         try:
             self.spreadsheet.del_worksheet(
                 self.spreadsheet.worksheet("Sheet1")
@@ -573,6 +585,123 @@ class GoogleSheetsDB:
         except Exception:
             pass   # 이력 기록 실패는 메인 작업에 영향 없이 무시
 
+    # ── BOM 변경이력 ─────────────────────────────────────────────────────────
+
+    def _append_bom_log(self, action: str, product_id: str, part_id: str,
+                        old_qty: float, new_qty: float):
+        """BOM변경이력 시트에 1행 추가. 실패해도 메인 작업에 영향 없음."""
+        try:
+            from core.auth import Session
+            products_map = {str(p["제품코드"]): p.get("제품명", "")
+                            for p in self._get_all_products_cached()}
+            parts_map    = self._get_parts_map()
+            prod_name    = products_map.get(str(product_id), "")
+            part_name    = parts_map.get(str(part_id), {}).get("부품명", "")
+            changed_by   = Session.user_name() or "시스템"
+            ws  = self.spreadsheet.worksheet(SHEET_BOM_LOG)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._safe_append_row(ws, [
+                now, action,
+                str(product_id), prod_name,
+                str(part_id), part_name,
+                float(old_qty) if old_qty is not None else "",
+                float(new_qty) if new_qty is not None else "",
+                changed_by,
+            ])
+        except Exception:
+            pass
+
+    def get_bom_change_history(self, start_date: str = None,
+                               end_date: str = None,
+                               product_id: str = None) -> list:
+        """BOM 변경이력 조회 (최신순). start/end: 'YYYY-MM-DD'"""
+        try:
+            ws      = self.spreadsheet.worksheet(SHEET_BOM_LOG)
+            records = ws.get_all_records()
+            result  = []
+            for r in records:
+                dt_str = str(r.get("변경일시", ""))[:10]
+                if not dt_str:
+                    continue
+                if start_date and dt_str < start_date:
+                    continue
+                if end_date and dt_str > end_date:
+                    continue
+                if product_id and str(r.get("제품코드", "")) != str(product_id):
+                    continue
+                result.append(r)
+            return list(reversed(result))
+        except Exception:
+            return []
+
+    # ── 분석용 집계 함수 ─────────────────────────────────────────────────────
+
+    def get_monthly_sales_with_margin(self, year: int = None) -> list:
+        """월별 판매 집계 (원가·마진 포함).
+        원가는 현재 BOM 기준 제품원가 × 판매수량으로 추산.
+        Returns: [{"월","건수","수량","판매대금","원가","마진","마진율"}, ...]
+        """
+        sales         = self.get_all_sales()
+        product_costs = self.get_all_product_costs()  # {product_id: unit_cost}
+        monthly: dict = {}
+        for r in sales:
+            dt_str = str(r.get("일시", ""))[:7]
+            if not dt_str or len(dt_str) < 7:
+                continue
+            if year and not dt_str.startswith(str(year)):
+                continue
+            pid    = str(r.get("제품코드", ""))
+            qty    = int(r.get("수량", 0) or 0)
+            amount = int(r.get("금액", 0) or 0)
+            cost   = float(product_costs.get(pid, 0)) * qty
+            if dt_str not in monthly:
+                monthly[dt_str] = {
+                    "월": dt_str, "건수": 0, "수량": 0,
+                    "판매대금": 0, "원가": 0.0, "마진": 0.0,
+                }
+            monthly[dt_str]["건수"]   += 1
+            monthly[dt_str]["수량"]   += qty
+            monthly[dt_str]["판매대금"] += amount
+            monthly[dt_str]["원가"]   += cost
+            monthly[dt_str]["마진"]   += amount - cost
+        result = sorted(monthly.values(), key=lambda x: x["월"])
+        for m in result:
+            rev = m["판매대금"]
+            m["마진율"] = round(m["마진"] / rev * 100, 1) if rev > 0 else 0.0
+            m["원가"]   = round(m["원가"])
+            m["마진"]   = round(m["마진"])
+        return result
+
+    def get_parts_io_summary(self, year: int = None) -> list:
+        """월별 부품 입출고 건수·수량 집계.
+        Returns: [{"월","입고건수","출고건수","입고수량","출고수량"}, ...]
+        """
+        history  = self.get_all_history()
+        monthly: dict = {}
+        for h in history:
+            dt_str = str(h.get("일시", ""))[:7]
+            if not dt_str or len(dt_str) < 7:
+                continue
+            if year and not dt_str.startswith(str(year)):
+                continue
+            h_type = str(h.get("유형", ""))
+            if h_type not in ("부품입고", "부품출고"):
+                continue
+            qty = int(h.get("수량", 0) or 0)
+            if dt_str not in monthly:
+                monthly[dt_str] = {
+                    "월": dt_str,
+                    "입고건수": 0, "출고건수": 0,
+                    "입고수량": 0, "출고수량": 0,
+                }
+            if h_type == "부품입고":
+                monthly[dt_str]["입고건수"] += 1
+                monthly[dt_str]["입고수량"] += qty
+            else:
+                monthly[dt_str]["출고건수"] += 1
+                monthly[dt_str]["출고수량"] += qty
+        return sorted(monthly.values(), key=lambda x: x["월"])
+
     def get_price_history(self, year=None, month=None, supplier=None):
         """단가변경이력 조회 (연·월·업체 필터 선택적 적용)"""
         ws      = self.spreadsheet.worksheet(SHEET_PRICE_LOG)
@@ -603,6 +732,94 @@ class GoogleSheetsDB:
                 "변경사유":  str(r.get("변경사유", "")),
             })
         return result
+
+    def get_monthly_price_change_report_data(self, year: int, month: int) -> dict:
+        """월간 단가변경 보고서용 데이터 집계.
+        해당 월에 단가가 변경된 부품별 요약과, 그 변경이 BOM을 통해
+        어떤 제품의 원가에 얼마나 영향을 주었는지를 계산한다.
+
+        Returns: {
+            "raw_rows": [해당월 변경이력 원본(시간순)],
+            "changed_parts": [{"품번","부품명","업체명","이전단가","변경단가","변경률","변경횟수"}],
+            "product_impacts": [{"제품코드","제품명","원가변경전","원가변경후","증감액","증감률","영향부품":[...]}],
+        }
+        """
+        ym        = f"{year}-{str(month).zfill(2)}"
+        all_price = self.get_price_history()
+        month_rows = sorted(
+            (r for r in all_price if r["변경일시"][:7] == ym),
+            key=lambda r: r["변경일시"],
+        )
+
+        changed: dict = {}
+        for r in month_rows:
+            pid = r["품번"]
+            if pid not in changed:
+                changed[pid] = {
+                    "품번": pid, "부품명": r["부품명"], "업체명": r["업체명"],
+                    "이전단가": r["이전단가"], "변경단가": r["변경단가"], "변경횟수": 0,
+                }
+            changed[pid]["변경단가"] = r["변경단가"]
+            changed[pid]["변경횟수"] += 1
+
+        changed_parts = []
+        for c in changed.values():
+            old, new = c["이전단가"], c["변경단가"]
+            c["변경률"] = round((new - old) / old * 100, 1) if old else None  # None = 신규
+            changed_parts.append(c)
+        changed_parts.sort(
+            key=lambda c: abs(c["변경률"]) if c["변경률"] is not None else 999,
+            reverse=True,
+        )
+
+        all_bom      = self.get_all_bom()
+        products_map = {str(p["제품코드"]): p.get("제품명", "")
+                        for p in self._get_all_products_cached()}
+        by_product: dict = {}
+        for b in all_bom:
+            by_product.setdefault(str(b.get("제품코드", "")), []).append(b)
+
+        changed_pids = set(changed.keys())
+        product_impacts = []
+        for pid, lines in by_product.items():
+            if not any(str(l.get("부품품번", "")) in changed_pids for l in lines):
+                continue
+            cost_before = 0.0
+            cost_after  = 0.0
+            affected    = []
+            for l in lines:
+                part_id = str(l.get("부품품번", ""))
+                qty     = float(l.get("소요량", 0) or 0)
+                if part_id in changed_pids:
+                    c        = changed[part_id]
+                    before_p = c["이전단가"]
+                    after_p  = c["변경단가"]
+                    affected.append({
+                        "부품품번": part_id, "부품명": c["부품명"], "소요량": qty,
+                        "이전단가": before_p, "변경단가": after_p,
+                        "원가증감": round((after_p - before_p) * qty),
+                    })
+                else:
+                    before_p = after_p = float(l.get("단가", 0) or 0)
+                cost_before += qty * before_p
+                cost_after  += qty * after_p
+            diff = cost_after - cost_before
+            if diff == 0:
+                continue
+            product_impacts.append({
+                "제품코드": pid, "제품명": products_map.get(pid, ""),
+                "원가변경전": round(cost_before), "원가변경후": round(cost_after),
+                "증감액": round(diff),
+                "증감률": round(diff / cost_before * 100, 1) if cost_before else None,
+                "영향부품": affected,
+            })
+        product_impacts.sort(key=lambda x: x["증감액"], reverse=True)
+
+        return {
+            "raw_rows": month_rows,
+            "changed_parts": changed_parts,
+            "product_impacts": product_impacts,
+        }
 
     def get_price_history_monthly_summary(self):
         """최근 12개월 월별 변경 건수 요약 반환"""
@@ -891,6 +1108,7 @@ class GoogleSheetsDB:
             str(product_id), str(part_id), float(qty), 0, note  # 단가 열은 항상 0
         ])
         self.cache.invalidate("bom")
+        self._append_bom_log("추가", product_id, part_id, None, qty)
 
     def update_bom(self, product_id: str, part_id: str,
                    qty: float, note: str = ""):
@@ -900,11 +1118,13 @@ class GoogleSheetsDB:
         for i, r in enumerate(records):
             if (str(r.get("제품코드", "")) == str(product_id) and
                     str(r.get("부품품번", "")) == str(part_id)):
+                old_qty = float(r.get("소요량", 0) or 0)
                 row = i + 2
                 self._safe_update(ws, f"A{row}:E{row}", [[
                     str(product_id), str(part_id), float(qty), 0, note  # 단가 열은 항상 0
                 ]])
                 self.cache.invalidate("bom")
+                self._append_bom_log("수정", product_id, part_id, old_qty, qty)
                 return True
         return False
 
@@ -913,20 +1133,22 @@ class GoogleSheetsDB:
         """BOM 항목의 품번을 교체. 기존 행의 부품품번을 새 품번으로 변경."""
         ws      = self.spreadsheet.worksheet(SHEET_BOM)
         records = ws.get_all_records()
-        # 새 품번이 이미 같은 제품 BOM에 존재하는지 확인
         for r in records:
             if (str(r.get("제품코드", "")) == str(product_id) and
                     str(r.get("부품품번", "")) == str(new_part_id)):
                 raise ValueError(f"품번 '{new_part_id}'은(는) 이미 이 제품의 BOM에 등록되어 있습니다.")
-        # 기존 행 찾아서 품번 포함 전체 업데이트
         for i, r in enumerate(records):
             if (str(r.get("제품코드", "")) == str(product_id) and
                     str(r.get("부품품번", "")) == str(old_part_id)):
+                old_qty = float(r.get("소요량", 0) or 0)
                 row = i + 2
                 self._safe_update(ws, f"A{row}:E{row}", [[
                     str(product_id), str(new_part_id), float(qty), 0, note
                 ]])
                 self.cache.invalidate("bom")
+                # 구부품 삭제 + 신부품 추가로 두 줄 기록
+                self._append_bom_log("삭제(교체)", product_id, old_part_id, old_qty, None)
+                self._append_bom_log("추가(교체)", product_id, new_part_id, None, qty)
                 return True
         return False
 
@@ -936,8 +1158,10 @@ class GoogleSheetsDB:
         for i, r in enumerate(records):
             if (str(r.get("제품코드", "")) == str(product_id) and
                     str(r.get("부품품번", "")) == str(part_id)):
+                old_qty = float(r.get("소요량", 0) or 0)
                 self._safe_delete_rows(ws, i + 2)
                 self.cache.invalidate("bom")
+                self._append_bom_log("삭제", product_id, part_id, old_qty, None)
                 return True
         return False
 
