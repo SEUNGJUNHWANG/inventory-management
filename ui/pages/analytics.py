@@ -566,6 +566,12 @@ class AnalyticsDashboard:
         self._ph_tree.tag_configure("down", background="#f0fdf4", foreground="#16a34a")
         self._ph_tree.tag_configure("new",  background="#eff6ff", foreground="#2563eb")
 
+        # 우클릭 삭제 메뉴
+        self._ph_row_data = {}   # tree iid → 원본 레코드 dict
+        self._ph_menu = tk.Menu(self.app.root, tearoff=0)
+        self._ph_menu.add_command(label="🗑 이 이력 삭제", command=self._ph_delete_selected)
+        self._ph_tree.bind("<Button-3>", self._ph_right_click)
+
         self._ph_load_data()
 
     def _ph_load_data(self):
@@ -713,16 +719,63 @@ class AnalyticsDashboard:
 
     def _ph_render_table(self, rows):
         self._ph_tree.delete(*self._ph_tree.get_children())
+        self._ph_row_data = {}
         self._ph_count_label.configure(text=f"({len(rows)}건)")
         for i, r in enumerate(rows, 1):
             rate = r["변경률"]
             tag  = "up" if rate.startswith("+") else ("down" if rate.startswith("-") else "new")
             old_p = f"{r['이전단가']:,.0f}" if r['이전단가'] else "-"
             new_p = f"{r['변경단가']:,.0f}" if r['변경단가'] else "-"
-            self._ph_tree.insert("", tk.END, values=(
+            iid = self._ph_tree.insert("", tk.END, values=(
                 i, r["변경일시"], r["품번"], r["부품명"], r["업체명"],
                 old_p, new_p, rate, r["변경자"], r["변경사유"],
             ), tags=(tag,))
+            self._ph_row_data[iid] = r
+
+    def _ph_right_click(self, event):
+        iid = self._ph_tree.identify_row(event.y)
+        if not iid:
+            return
+        self._ph_tree.selection_set(iid)
+        self._ph_menu.post(event.x_root, event.y_root)
+
+    def _ph_delete_selected(self):
+        selected = self._ph_tree.selection()
+        if not selected:
+            return
+        iid = selected[0]
+        r = self._ph_row_data.get(iid)
+        if not r:
+            return
+
+        old_p = f"{r['이전단가']:,.0f}" if r['이전단가'] else "-"
+        new_p = f"{r['변경단가']:,.0f}" if r['변경단가'] else "-"
+        info = (f"변경일시: {r['변경일시']}\n"
+                f"품번: {r['품번']} ({r['부품명']})\n"
+                f"업체명: {r['업체명']}\n"
+                f"{old_p} → {new_p}원 ({r['변경률']})")
+        if not messagebox.askyesno("이력 삭제",
+                                    f"다음 단가변경이력을 삭제하시겠습니까?\n\n{info}\n\n"
+                                    "※ 이 작업은 이력 기록만 제거하며 부품 현재 단가에는 영향을 주지 않습니다."):
+            return
+
+        def work():
+            try:
+                ok = self.app.db.delete_price_history(
+                    r["변경일시"], r["품번"], r["이전단가"], r["변경단가"])
+                self.app.root.after(0, lambda: self._ph_delete_done(ok))
+            except Exception as e:
+                err = str(e)
+                self.app.root.after(0, lambda: messagebox.showerror("오류", err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ph_delete_done(self, ok):
+        if ok:
+            messagebox.showinfo("삭제 완료", "이력이 삭제되었습니다.")
+            self._ph_load_data()
+        else:
+            messagebox.showerror("삭제 실패", "해당 이력을 찾을 수 없습니다. 목록을 새로고침 후 다시 시도해주세요.")
 
     def _ph_sort_by(self, col):
         if self._ph_sort_col == col:

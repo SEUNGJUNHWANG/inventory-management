@@ -733,6 +733,21 @@ class GoogleSheetsDB:
             })
         return result
 
+    def delete_price_history(self, changed_at: str, part_id: str,
+                             old_price: float, new_price: float) -> bool:
+        """단가변경이력 1건 삭제. (변경일시, 품번, 이전단가, 변경단가)가 모두 일치하는
+        첫 번째 행을 찾아 삭제한다. 잘못 기록된 이력을 정정할 때 사용."""
+        ws      = self.spreadsheet.worksheet(SHEET_PRICE_LOG)
+        records = ws.get_all_records()
+        for i, r in enumerate(records):
+            if (str(r.get("변경일시", "")) == str(changed_at) and
+                    str(r.get("품번", "")) == str(part_id) and
+                    float(r.get("이전단가", 0) or 0) == float(old_price) and
+                    float(r.get("변경단가", 0) or 0) == float(new_price)):
+                self._safe_delete_rows(ws, i + 2)
+                return True
+        return False
+
     def get_monthly_price_change_report_data(self, year: int, month: int) -> dict:
         """월간 단가변경 보고서용 데이터 집계.
         해당 월에 단가가 변경된 부품별 요약과, 그 변경이 BOM을 통해
