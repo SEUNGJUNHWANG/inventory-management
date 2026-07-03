@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-# 테노바 재고관리 - GitHub 업로드 스크립트
+﻿# 업로드 스크립트
 
 Set-Location -Path $PSScriptRoot
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
