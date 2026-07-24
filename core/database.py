@@ -465,6 +465,25 @@ class GoogleSheetsDB:
         self.cache.set("parts_map", parts_map)
         return parts_map
 
+    def _get_fresh_parts_with_rows(self):
+        """SHEET_PARTS를 단 1회 API 호출로 읽어 (parts_map, all_values) 동시 반환.
+        _produce_product_locked 에서 parts_map 조회와 _bulk_update_part_qtys 의
+        행번호 조회를 합쳐 API 호출 1회를 절약합니다."""
+        ws         = self.spreadsheet.worksheet(SHEET_PARTS)
+        all_values = self._safe_get_all_values(ws)
+        if not all_values:
+            return {}, []
+        headers = all_values[0]
+        records = []
+        for row in all_values[1:]:
+            if any(row):
+                padded = (list(row) + [""] * len(headers))[:len(headers)]
+                records.append(dict(zip(headers, padded)))
+        self.cache.set("parts", records)
+        parts_map = {str(r.get("품번", "")): r for r in records}
+        self.cache.set("parts_map", parts_map)
+        return parts_map, all_values
+
     def _get_fresh_product(self, product_id: str):
         """구글 시트에서 직접 최신 제품 데이터를 읽어 반환 (캐시 우회)"""
         ws      = self.spreadsheet.worksheet(SHEET_PRODUCTS)
@@ -504,7 +523,7 @@ class GoogleSheetsDB:
 
     def update_part_qty(self, part_id: str, new_qty: int):
         ws      = self.spreadsheet.worksheet(SHEET_PARTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         for i, r in enumerate(records):
             if str(r.get("품번", "")) == str(part_id):
                 self._safe_update_cell(ws, i + 2, 7, int(new_qty))
@@ -513,10 +532,15 @@ class GoogleSheetsDB:
                 return True
         return False
 
-    def _bulk_update_part_qtys(self, updates):
-        """재고 수량 일괄 업데이트 (API 1회) - 재시도 포함"""
-        ws         = self.spreadsheet.worksheet(SHEET_PARTS)
-        all_values = ws.get_all_values()
+    def _bulk_update_part_qtys(self, updates, parts_all_values=None):
+        """재고 수량 일괄 업데이트 (API 1회) - 재시도 포함
+        parts_all_values: _get_fresh_parts_with_rows() 에서 미리 읽어온 경우 전달해
+                          SHEET_PARTS 이중 읽기를 방지합니다."""
+        ws = self.spreadsheet.worksheet(SHEET_PARTS)
+        if parts_all_values is None:
+            all_values = self._safe_get_all_values(ws)
+        else:
+            all_values = parts_all_values
 
         row_map = {}
         for i, row in enumerate(all_values[1:], 2):
@@ -541,7 +565,7 @@ class GoogleSheetsDB:
                     note="", supplier="", unit_price=0, moq=0,
                     changed_by="", change_reason=""):
         ws      = self.spreadsheet.worksheet(SHEET_PARTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         for i, r in enumerate(records):
             if str(r.get("품번", "")) == str(part_id):
                 old_price = float(r.get("단가", 0) or 0)
@@ -1044,7 +1068,7 @@ class GoogleSheetsDB:
 
     def update_product_qty(self, product_id: str, new_qty: int):
         ws      = self.spreadsheet.worksheet(SHEET_PRODUCTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         for i, r in enumerate(records):
             if str(r.get("제품코드", "")) == str(product_id):
                 self._safe_update_cell(ws, i + 2, 4, int(new_qty))
@@ -1054,7 +1078,7 @@ class GoogleSheetsDB:
 
     def update_product(self, product_id, name, spec, qty, selling_price=0, note=""):
         ws      = self.spreadsheet.worksheet(SHEET_PRODUCTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         for i, r in enumerate(records):
             if str(r.get("제품코드", "")) == str(product_id):
                 row = i + 2
@@ -1079,7 +1103,7 @@ class GoogleSheetsDB:
 
     def delete_product(self, product_id: str):
         ws      = self.spreadsheet.worksheet(SHEET_PRODUCTS)
-        records = ws.get_all_records()
+        records = self._safe_get_all_records(ws)
         for i, r in enumerate(records):
             if str(r.get("제품코드", "")) == str(product_id):
                 self._safe_delete_rows(ws, i + 2)
@@ -1347,8 +1371,9 @@ class GoogleSheetsDB:
         if not bom:
             return False, f"제품 '{product['제품명']}'의 BOM이 없습니다.", []
 
-        # 재고 검증에도 캐시 우회 → 락 취득 직후의 실제 재고 사용
-        parts_map = self._get_fresh_parts_map()
+        # 부품 데이터를 한 번만 읽어 parts_map과 all_values를 동시에 확보
+        # (이후 _bulk_update_part_qtys에 all_values를 전달해 이중 읽기 방지)
+        parts_map, parts_all_values = self._get_fresh_parts_with_rows()
 
         # 1단계: 재고 검증
         shortage = []
@@ -1414,7 +1439,7 @@ class GoogleSheetsDB:
                     f"  ✅ {part['부품명']}({part_id}): -{required}개 → {new_qty}개"
                 )
 
-        self._bulk_update_part_qtys(qty_updates)
+        self._bulk_update_part_qtys(qty_updates, parts_all_values=parts_all_values)
         self._add_history_batch(history_entries)
 
         # 3단계: 제품 재고 증가
