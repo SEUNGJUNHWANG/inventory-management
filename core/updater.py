@@ -185,9 +185,9 @@ def check_for_updates(root: tk.Tk, silent: bool = True):
     """
     if not REQUESTS_AVAILABLE:
         return
-    # 개발 환경에서는 업데이트 체크 생략 (선택적)
-    # if not getattr(sys, "frozen", False):
-    #     return
+    # 소스코드 실행(개발환경)에서는 업데이트 체크 생략
+    if not getattr(sys, "frozen", False):
+        return
 
     def _worker():
         release = _fetch_latest_release()
