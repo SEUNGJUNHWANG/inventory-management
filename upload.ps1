@@ -56,12 +56,36 @@ if ($LASTEXITCODE -ne 0) {
     exit
 }
 
-Write-Host "  [3/3] GitHub에 업로드 중..." -ForegroundColor Gray
+Write-Host "  [3/4] GitHub에 업로드 중..." -ForegroundColor Gray
 git push origin main
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  [오류] git push 실패" -ForegroundColor Red
     Read-Host "  아무 키나 누르세요"
     exit
+}
+
+# constants.py 에서 버전 자동 읽기
+$verLine = Select-String -Path "core\constants.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"'
+if ($verLine) {
+    $version = $verLine.Matches[0].Groups[1].Value
+    $tag = "v$version"
+
+    # 이미 존재하는 태그인지 확인
+    $existingTag = git tag -l $tag 2>$null
+    if ($existingTag) {
+        Write-Host "  [알림] 태그 $tag 는 이미 존재합니다. 태그 단계를 건너뜁니다." -ForegroundColor Yellow
+    } else {
+        Write-Host "  [4/4] 버전 태그($tag) 생성 및 푸시 중..." -ForegroundColor Gray
+        git tag $tag
+        git push origin $tag
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  [오류] 태그 푸시 실패" -ForegroundColor Red
+        } else {
+            Write-Host "  버전 태그 $tag 푸시 완료! (EXE 빌드 자동 시작)" -ForegroundColor Green
+        }
+    }
+} else {
+    Write-Host "  [알림] 버전 정보를 읽을 수 없어 태그 생성을 건너뜁니다." -ForegroundColor Yellow
 }
 
 Write-Host ""
