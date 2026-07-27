@@ -260,7 +260,7 @@ class ProductsPage:
 
         dialog = tk.Toplevel(self.app.root)
         dialog.title("제품 수정")
-        self.app.center_dialog(dialog, 420, 410)
+        self.app.center_dialog(dialog, 420, 450)
         dialog.resizable(False, False)
         dialog.transient(self.app.root)
         dialog.grab_set()
@@ -289,18 +289,18 @@ class ProductsPage:
                 entry.configure(state="readonly")
             fields[label] = entry
 
-        # 변경사유 안내 (판매가 변경 시에만 이력에 기록됨)
-        tk.Label(dialog, text="※ 판매가 변경 시 변경사유가 이력에 기록됩니다.",
+        # 변경사유 안내 — 별도 행(row=len)에 배치하여 입력칸과 겹치지 않게
+        tk.Label(dialog, text="  ※ 판매가 변경 시 변경사유가 이력에 기록됩니다.",
                  bg=dialog.cget("bg"), fg=COLORS["text_secondary"],
                  font=(FONT_FAMILY, FONT_SIZES["tiny"])).grid(
-            row=len(label_defs) - 1, column=1, sticky="w", padx=(0, 10))
+            row=len(label_defs), column=0, columnspan=2, sticky="w", padx=5, pady=(0, 2))
 
         # 원가 · 마진율 안내 (BOM 기반 자동계산, 읽기전용)
         cost_text = f"원가: {values[4]}원  │  마진율: {values[6]}  (BOM 기준 자동계산)"
         tk.Label(dialog, text=cost_text, bg=dialog.cget("bg"),
                  fg=COLORS["text_secondary"],
                  font=(FONT_FAMILY, FONT_SIZES["tiny"])).grid(
-            row=len(label_defs), column=0, columnspan=2, pady=(0, 4))
+            row=len(label_defs) + 1, column=0, columnspan=2, pady=(0, 4))
 
         def save():
             try:
@@ -324,7 +324,7 @@ class ProductsPage:
                              font=(FONT_FAMILY, FONT_SIZES["small"], "bold"),
                              bg=COLORS["primary"], fg="white", padx=20, pady=5,
                              command=save)
-        save_btn.grid(row=len(label_defs) + 1, column=0, columnspan=2, pady=10)
+        save_btn.grid(row=len(label_defs) + 2, column=0, columnspan=2, pady=10)
         dialog.bind("<Return>", lambda e: flash_btn(save_btn, save))
 
     def _delete_product(self):

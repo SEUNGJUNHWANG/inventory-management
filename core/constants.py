@@ -7,7 +7,7 @@
 # 앱 정보
 # ─────────────────────────────────────────
 APP_NAME = "재고관리 시스템"
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.1.4"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_AUTHOR = "Tenova"
 APP_BUILD_DATE = "2026-04-29"
