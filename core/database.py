@@ -48,8 +48,9 @@ SHEET_USERS     = "사용자"
 SHEET_CUSTOMERS = "거래처"
 SHEET_SALES     = "판매이력"
 SHEET_MRP       = "MRP이력"
-SHEET_PRICE_LOG = "단가변경이력"
-SHEET_BOM_LOG   = "BOM변경이력"
+SHEET_PRICE_LOG         = "단가변경이력"
+SHEET_PRODUCT_PRICE_LOG = "제품판매단가이력"
+SHEET_BOM_LOG           = "BOM변경이력"
 
 # 캐시 유효 시간 (초)
 CACHE_TTL         = 120   # 부품·제품·BOM: 2분
@@ -314,6 +315,17 @@ class GoogleSheetsDB:
         except gspread.exceptions.WorksheetNotFound:
             ws = self.spreadsheet.add_worksheet(title=SHEET_PRICE_LOG, rows=5000, cols=10)
             self._safe_update(ws, "A1:I1", [PRICE_LOG_HEADERS])
+
+        # 제품판매단가이력 시트
+        PRODUCT_PRICE_LOG_HEADERS = [
+            "변경일시", "제품코드", "제품명",
+            "이전판매가", "변경판매가", "변경률", "변경자", "변경사유"
+        ]
+        try:
+            self.spreadsheet.worksheet(SHEET_PRODUCT_PRICE_LOG)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(title=SHEET_PRODUCT_PRICE_LOG, rows=5000, cols=10)
+            self._safe_update(ws, "A1:H1", [PRODUCT_PRICE_LOG_HEADERS])
 
         # BOM변경이력 시트
         BOM_LOG_HEADERS = [
@@ -609,6 +621,24 @@ class GoogleSheetsDB:
         except Exception:
             pass   # 이력 기록 실패는 메인 작업에 영향 없이 무시
 
+    def _append_product_price_log(self, product_id, product_name,
+                                   old_price, new_price, changed_by="", reason=""):
+        """제품판매단가이력 시트에 1행 추가"""
+        try:
+            ws = self.spreadsheet.worksheet(SHEET_PRODUCT_PRICE_LOG)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if old_price == 0:
+                rate_str = "신규"
+            else:
+                rate = (new_price - old_price) / old_price * 100
+                rate_str = f"{rate:+.1f}%"
+            self._safe_append_row(ws, [
+                now, product_id, product_name,
+                old_price, new_price, rate_str, changed_by, reason
+            ])
+        except Exception:
+            pass
+
     # ── BOM 변경이력 ─────────────────────────────────────────────────────────
 
     def _append_bom_log(self, action: str, product_id: str, part_id: str,
@@ -879,6 +909,52 @@ class GoogleSheetsDB:
                 counts[ym]["down"] += 1
         return dict(counts)
 
+    def get_product_price_history(self):
+        """제품판매단가이력 전체 조회"""
+        try:
+            ws = self.spreadsheet.worksheet(SHEET_PRODUCT_PRICE_LOG)
+        except gspread.exceptions.WorksheetNotFound:
+            return []
+        records = self._safe_get_all_records(ws)
+        result  = []
+        for r in records:
+            dt_str = str(r.get("변경일시", ""))
+            if not dt_str:
+                continue
+            result.append({
+                "변경일시":   dt_str,
+                "제품코드":   str(r.get("제품코드", "")),
+                "제품명":     str(r.get("제품명", "")),
+                "이전판매가": float(r.get("이전판매가", 0) or 0),
+                "변경판매가": float(r.get("변경판매가", 0) or 0),
+                "변경률":     str(r.get("변경률", "")),
+                "변경자":     str(r.get("변경자", "")),
+                "변경사유":   str(r.get("변경사유", "")),
+            })
+        return result
+
+    def get_product_price_history_monthly_summary(self):
+        """제품판매단가이력 최근 12개월 월별 요약"""
+        from collections import defaultdict
+        try:
+            ws = self.spreadsheet.worksheet(SHEET_PRODUCT_PRICE_LOG)
+        except gspread.exceptions.WorksheetNotFound:
+            return {}
+        records = self._safe_get_all_records(ws)
+        counts  = defaultdict(lambda: {"total": 0, "up": 0, "down": 0})
+        for r in records:
+            dt_str = str(r.get("변경일시", ""))
+            if len(dt_str) < 7:
+                continue
+            ym   = dt_str[:7]
+            rate = str(r.get("변경률", ""))
+            counts[ym]["total"] += 1
+            if rate.startswith("+"):
+                counts[ym]["up"] += 1
+            elif rate.startswith("-"):
+                counts[ym]["down"] += 1
+        return dict(counts)
+
     def bulk_add_or_update_parts(self, parts_list, progress_callback=None):
         """
         부품 대량 등록/수정 (v2.1 - 429 자동 재시도 + 배치 딜레이)
@@ -1076,15 +1152,30 @@ class GoogleSheetsDB:
                 return True
         return False
 
-    def update_product(self, product_id, name, spec, qty, selling_price=0, note=""):
+    def update_product(self, product_id, name, spec, qty, selling_price=0, note="",
+                       change_reason=""):
         ws      = self.spreadsheet.worksheet(SHEET_PRODUCTS)
         records = self._safe_get_all_records(ws)
         for i, r in enumerate(records):
             if str(r.get("제품코드", "")) == str(product_id):
+                old_price = float(r.get("판매가", 0) or 0)
+                new_price = float(selling_price)
                 row = i + 2
                 self._safe_update(ws, f"A{row}:F{row}",
-                                  [[str(product_id), name, spec, int(qty), float(selling_price), note]])
+                                  [[str(product_id), name, spec, int(qty), new_price, note]])
                 self.cache.invalidate("products")
+                # 판매가가 달라진 경우에만 이력 기록
+                if old_price != new_price:
+                    from core.auth import Session
+                    changed_by = Session.user_name() or "시스템"
+                    self._append_product_price_log(
+                        product_id=str(product_id),
+                        product_name=str(name),
+                        old_price=old_price,
+                        new_price=new_price,
+                        changed_by=changed_by,
+                        reason=change_reason,
+                    )
                 return True
         return False
 

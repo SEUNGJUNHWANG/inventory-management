@@ -260,7 +260,7 @@ class ProductsPage:
 
         dialog = tk.Toplevel(self.app.root)
         dialog.title("제품 수정")
-        self.app.center_dialog(dialog, 420, 360)
+        self.app.center_dialog(dialog, 420, 410)
         dialog.resizable(False, False)
         dialog.transient(self.app.root)
         dialog.grab_set()
@@ -276,6 +276,7 @@ class ProductsPage:
             ("현재재고",   str(values[3]), False),
             ("판매가(원)", str(values[5]).replace(",", "").replace("-", "0"), False),
             ("비고",       str(values[7]), False),
+            ("변경사유",   "", False),
         ]
 
         for i, (label, default, readonly) in enumerate(label_defs):
@@ -287,6 +288,12 @@ class ProductsPage:
             if readonly:
                 entry.configure(state="readonly")
             fields[label] = entry
+
+        # 변경사유 안내 (판매가 변경 시에만 이력에 기록됨)
+        tk.Label(dialog, text="※ 판매가 변경 시 변경사유가 이력에 기록됩니다.",
+                 bg=dialog.cget("bg"), fg=COLORS["text_secondary"],
+                 font=(FONT_FAMILY, FONT_SIZES["tiny"])).grid(
+            row=len(label_defs) - 1, column=1, sticky="w", padx=(0, 10))
 
         # 원가 · 마진율 안내 (BOM 기반 자동계산, 읽기전용)
         cost_text = f"원가: {values[4]}원  │  마진율: {values[6]}  (BOM 기준 자동계산)"
@@ -305,6 +312,7 @@ class ProductsPage:
                     int(fields["현재재고"].get()),
                     float(sp_raw) if sp_raw else 0,
                     fields["비고"].get().strip(),
+                    change_reason=fields["변경사유"].get().strip(),
                 )
                 messagebox.showinfo("성공", "제품 정보가 수정되었습니다.")
                 dialog.destroy()
