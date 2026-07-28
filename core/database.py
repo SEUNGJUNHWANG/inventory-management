@@ -322,10 +322,14 @@ class GoogleSheetsDB:
             "이전판매가", "변경판매가", "변경률", "변경자", "변경사유"
         ]
         try:
-            self.spreadsheet.worksheet(SHEET_PRODUCT_PRICE_LOG)
+            ws_ppl = self.spreadsheet.worksheet(SHEET_PRODUCT_PRICE_LOG)
+            # 헤더 열이 부족하면 보완 (예: 이전 버전에서 변경사유 컬럼 없이 생성된 경우)
+            existing_headers = ws_ppl.row_values(1)
+            if existing_headers != PRODUCT_PRICE_LOG_HEADERS:
+                self._safe_update(ws_ppl, "A1:H1", [PRODUCT_PRICE_LOG_HEADERS])
         except gspread.exceptions.WorksheetNotFound:
-            ws = self.spreadsheet.add_worksheet(title=SHEET_PRODUCT_PRICE_LOG, rows=5000, cols=10)
-            self._safe_update(ws, "A1:H1", [PRODUCT_PRICE_LOG_HEADERS])
+            ws_ppl = self.spreadsheet.add_worksheet(title=SHEET_PRODUCT_PRICE_LOG, rows=5000, cols=10)
+            self._safe_update(ws_ppl, "A1:H1", [PRODUCT_PRICE_LOG_HEADERS])
 
         # BOM변경이력 시트
         BOM_LOG_HEADERS = [
