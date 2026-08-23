@@ -1760,6 +1760,85 @@ class GoogleSheetsDB:
                 filtered.append(r)
         return filtered
 
+    # ── 거래처(매입처)별 입출고 집계 ──────────────────────────────────────────
+
+    # 집계 대상 유형 → (방향, 부호). 취소 이력은 원 유형을 음수로 상계한다.
+    _SUPPLIER_IO_TYPES = {
+        "부품입고":     ("입고", +1),
+        "부품입고취소": ("입고", -1),
+        "부품출고":     ("출고", +1),
+        "부품출고취소": ("출고", -1),
+    }
+
+    NO_SUPPLIER_LABEL = "(미지정)"
+
+    def get_supplier_names(self) -> list:
+        """부품마스터에 등록된 업체명 목록 (중복 제거·정렬)."""
+        parts = self._get_all_parts_cached()
+        names = {str(p.get("업체명", "")).strip()
+                 for p in parts if str(p.get("업체명", "")).strip()}
+        return sorted(names)
+
+    def get_supplier_io_summary(self, start_date: str = None,
+                                end_date: str = None) -> list:
+        """거래처(매입처)별·월별 부품 입출고 집계.
+
+        거래처는 이력에 저장되지 않으므로 품번으로 부품마스터를 조인해
+        업체명을 유도한다. 취소 이력(부품입고취소/부품출고취소)은 원 유형에서
+        차감하여 실제 순수량을 반영한다.
+
+        금액은 부품마스터의 '현재' 단가 × 수량으로 산출한 추산값이다.
+
+        Returns: [{"업체명","월","입고건수","입고수량","출고건수","출고수량",
+                   "입고금액","출고금액"}, ...]  (업체명·월 오름차순)
+        """
+        history   = self.get_all_history()
+        parts_map = self._get_parts_map()
+        agg: dict = {}
+
+        for h in history:
+            h_type = str(h.get("유형", ""))
+            spec   = self._SUPPLIER_IO_TYPES.get(h_type)
+            if not spec:
+                continue                      # 제품출고·생산입고 등은 매입처 개념 없음
+
+            dt_str = str(h.get("일시", ""))
+            if len(dt_str) < 7:
+                continue
+            if start_date and dt_str[:10] < start_date:
+                continue
+            if end_date and dt_str[:10] > end_date:
+                continue
+
+            direction, sign = spec
+            part_id  = str(h.get("품번/제품코드", ""))
+            part     = parts_map.get(part_id, {})
+            supplier = str(part.get("업체명", "")).strip() or self.NO_SUPPLIER_LABEL
+            price    = float(part.get("단가", 0) or 0)
+
+            try:
+                qty = int(h.get("수량", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+
+            key = (supplier, dt_str[:7])
+            if key not in agg:
+                agg[key] = {
+                    "업체명": supplier, "월": dt_str[:7],
+                    "입고건수": 0, "입고수량": 0, "입고금액": 0.0,
+                    "출고건수": 0, "출고수량": 0, "출고금액": 0.0,
+                }
+            row = agg[key]
+            row[f"{direction}건수"] += sign
+            row[f"{direction}수량"] += sign * qty
+            row[f"{direction}금액"] += sign * qty * price
+
+        result = sorted(agg.values(), key=lambda r: (r["업체명"], r["월"]))
+        for r in result:
+            r["입고금액"] = round(r["입고금액"])
+            r["출고금액"] = round(r["출고금액"])
+        return result
+
     # ── 안전재고 알림 ──────────────────────────────────────────────────────────
 
     def get_safety_stock_alerts(self):
